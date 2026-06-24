@@ -48,6 +48,7 @@ def run_live_bot():
     send_admin_alert("🚀 Signal Bot Pro is now online and scanning markets.")
 
     cmd_handler       = BotCommandHandler()
+    cmd_handler.start()   # launches background thread — commands respond instantly
     last_data_refresh = datetime.min
     last_daily_report = datetime.min
     last_weekly_report = datetime.min
@@ -95,14 +96,12 @@ def run_live_bot():
                 last_weekly_report = now
                 logger.info("Weekly report sent.")
 
-            # 5. Poll Telegram commands
-            cmd_handler.poll_once()
-
             logger.info(f"Sleeping {SCAN_INTERVAL}s until next scan...")
             time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
             logger.info("Bot stopped by user.")
+            cmd_handler.stop()
             send_admin_alert("⏹️ Signal Bot Pro was stopped manually.")
             break
         except Exception as exc:
