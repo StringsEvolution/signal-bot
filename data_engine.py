@@ -89,48 +89,52 @@ def init_db():
 
 
 # ---------------------------------------------------------------------------
-# OHLC fetch — uses Alpha Vantage (free tier) or synthetic fallback for demo
+# OHLC fetch — uses Twelve Data (free tier) or synthetic fallback for demo
 # ---------------------------------------------------------------------------
 
-def _fetch_alpha_vantage(asset: str, timeframe: str, api_key: str) -> pd.DataFrame:
-    """Fetch from Alpha Vantage FX/commodity endpoints."""
-    AV_TF = {"M1": "1min", "M5": "5min", "M15": "15min"}
-    interval = AV_TF[timeframe]
-
+def _fetch_twelve_data(asset: str, timeframe: str, api_key: str) -> pd.DataFrame:
+    """Fetch from Twelve Data API."""
+    # Twelve Data interval mapping
+    TD_INTERVAL = {"M1": "1min", "M5": "5min", "M15": "15min"}
+    interval = TD_INTERVAL[timeframe]
+    
+    # Twelve Data expects format like "EUR/USD" or "XAU/USD"
     if asset == "XAUUSD":
-        # Alpha Vantage treats gold as a commodity
-        url = (
-            f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY"
-            f"&symbol=XAUUSD&interval={interval}&outputsize=compact&apikey={api_key}"
-        )
+        symbol = "XAU/USD"
     else:
-        from_sym, to_sym = asset[:3], asset[3:]
-        url = (
-            f"https://www.alphavantage.co/query?function=FX_INTRADAY"
-            f"&from_symbol={from_sym}&to_symbol={to_sym}"
-            f"&interval={interval}&outputsize=compact&apikey={api_key}"
-        )
-
+        # EURUSD -> EUR/USD
+        symbol = f"{asset[:3]}/{asset[3:]}"
+    
+    url = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={symbol}"
+        f"&interval={interval}"
+        f"&outputsize=200"
+        f"&apikey={api_key}"
+    )
+    
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-
-    key = [k for k in data if "Time Series" in k]
-    if not key:
-        raise ValueError(f"Unexpected AV response: {list(data.keys())}")
-
-    raw = data[key[0]]
+    
+    # Check for API errors
+    if "status" in data and data["status"] == "error":
+        raise ValueError(f"Twelve Data error: {data.get('message', 'Unknown error')}")
+    
+    if "values" not in data or not data["values"]:
+        raise ValueError(f"No data returned from Twelve Data for {asset}")
+    
     rows = []
-    for ts_str, vals in raw.items():
+    for vals in data["values"]:
         rows.append({
-            "timestamp": pd.to_datetime(ts_str),
-            "open":  float(vals.get("1. open",  vals.get("1. Open",  0))),
-            "high":  float(vals.get("2. high",  vals.get("2. High",  0))),
-            "low":   float(vals.get("3. low",   vals.get("3. Low",   0))),
-            "close": float(vals.get("4. close", vals.get("4. Close", 0))),
-            "volume": float(vals.get("5. volume", vals.get("5. Volume", 0))),
+            "timestamp": pd.to_datetime(vals["datetime"]),
+            "open":  float(vals["open"]),
+            "high":  float(vals["high"]),
+            "low":   float(vals["low"]),
+            "close": float(vals["close"]),
+            "volume": float(vals.get("volume", 0)),
         })
-
+    
     df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
     return df
 
@@ -172,16 +176,16 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
 def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
     """
     Primary fetch function.
-    Tries Alpha Vantage if API key is set, else falls back to synthetic data.
+    Tries Twelve Data if API key is set, else falls back to synthetic data.
     """
-    api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+    api_key = os.getenv("TWELVE_DATA_KEY", "")
     if api_key and api_key != "demo":
         try:
-            df = _fetch_alpha_vantage(asset, timeframe, api_key)
-            logger.info(f"Fetched {len(df)} candles for {asset} {timeframe} from Alpha Vantage.")
+            df = _fetch_twelve_data(asset, timeframe, api_key)
+            logger.info(f"Fetched {len(df)} candles for {asset} {timeframe} from Twelve Data.")
             return df.tail(n_candles).reset_index(drop=True)
         except Exception as exc:
-            logger.warning(f"Alpha Vantage fetch failed ({exc}), using synthetic data.")
+            logger.warning(f"Twelve Data fetch failed ({exc}), using synthetic data.")
 
     df = _synthetic_ohlc(asset, timeframe, n_candles)
     logger.info(f"Using synthetic data for {asset} {timeframe} ({len(df)} candles).")
