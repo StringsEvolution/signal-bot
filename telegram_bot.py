@@ -247,7 +247,7 @@ class BotCommandHandler:
                 f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
                 f"⏱️ Uptime: {uptime}\n\n"
                 f"📡 <b>Scanning:</b>\n"
-                f"  Pairs: EURUSD · GBPUSD · XAUUSD\n"
+                f"  Pairs: EURUSD · GBPUSD · XAUUSD . USDJPY . BTC USD\n"
                 f"  Timeframes: M1 · M5 · M15\n"
                 f"  Interval: every 60s\n\n"
                 f"🤖 AI mode: {'ML model' if _ml_model_loaded() else 'Heuristic (pre-training)'}\n"
