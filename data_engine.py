@@ -377,7 +377,25 @@ def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame
 # ---------------------------------------------------------------------------
 
 def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
+    """Bulk upsert — inserts all rows in one query instead of row-by-row."""
+    if df.empty:
+        return
+
     engine = get_engine()
+    rows   = [
+        {
+            "asset":     asset,
+            "timeframe": timeframe,
+            "timestamp": row["timestamp"],
+            "open":      float(row["open"]),
+            "high":      float(row["high"]),
+            "low":       float(row["low"]),
+            "close":     float(row["close"]),
+            "volume":    float(row.get("volume", 0)),
+        }
+        for _, row in df.iterrows()
+    ]
+
     upsert = text("""
         INSERT INTO ohlc_data (asset, timeframe, timestamp, open, high, low, close, volume)
         VALUES (:asset, :timeframe, :timestamp, :open, :high, :low, :close, :volume)
@@ -386,16 +404,11 @@ def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
                 low=EXCLUDED.low,  close=EXCLUDED.close,
                 volume=EXCLUDED.volume
     """)
+
     with engine.connect() as conn:
-        for _, row in df.iterrows():
-            conn.execute(upsert, {
-                "asset": asset, "timeframe": timeframe,
-                "timestamp": row["timestamp"],
-                "open":   float(row["open"]),  "high": float(row["high"]),
-                "low":    float(row["low"]),   "close": float(row["close"]),
-                "volume": float(row.get("volume", 0)),
-            })
+        conn.execute(upsert, rows)   # bulk — all rows in one round-trip
         conn.commit()
+
     logger.debug(f"Stored {len(df)} rows for {asset}/{timeframe}.")
 
 
