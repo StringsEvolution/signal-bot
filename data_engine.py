@@ -23,10 +23,10 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 ASSETS     = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "BTCUSD"]
-TIMEFRAMES = ["M1", "M5", "M15"]
+TIMEFRAMES = ["M1", "M2", "M3", "M5", "M15"]
 
-TF_MINUTES = {"M1": 1,  "M5": 5,  "M15": 15}
-TF_EXPIRY  = {"M1": 3,  "M5": 5,  "M15": 15}
+TF_MINUTES = {"M1": 1,  "M2": 2,  "M3": 3,  "M5": 5,  "M15": 15}
+TF_EXPIRY  = {"M1": 1,  "M2": 2,  "M3": 3,  "M5": 5,  "M15": 15}
 
 # Deriv symbol mapping
 DERIV_SYMBOLS = {
@@ -38,7 +38,7 @@ DERIV_SYMBOLS = {
 }
 
 # Deriv granularity in seconds
-DERIV_GRANULARITY = {"M1": 60, "M5": 300, "M15": 900}
+DERIV_GRANULARITY = {"M1": 60, "M2": 120, "M3": 180, "M5": 300, "M15": 900}
 
 DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
