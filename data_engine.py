@@ -89,56 +89,182 @@ def init_db():
 
 
 # ---------------------------------------------------------------------------
-# OHLC fetch — uses Twelve Data (free tier) or synthetic fallback for demo
+# Rotating API Key Manager
 # ---------------------------------------------------------------------------
 
-def _fetch_twelve_data(asset: str, timeframe: str, api_key: str) -> pd.DataFrame:
-    """Fetch from Twelve Data API."""
-    # Twelve Data interval mapping
+class TwelveDataKeyManager:
+    """
+    Rotates between two (or more) Twelve Data API keys.
+    Switches automatically when a key hits its rate or daily limit.
+
+    Set in Railway environment variables:
+        TWELVE_DATA_KEY_1=your_first_key
+        TWELVE_DATA_KEY_2=your_second_key
+
+    Legacy single-key fallback still supported:
+        TWELVE_DATA_KEY=your_key
+    """
+
+    def __init__(self):
+        self.keys        = self._load_keys()
+        self.current_idx = 0
+        self.exhausted   = set()
+
+    def _load_keys(self):
+        keys = []
+        for i in range(1, 11):
+            k = os.getenv(f"TWELVE_DATA_KEY_{i}", "").strip()
+            if k:
+                keys.append(k)
+        # fallback: single key
+        if not keys:
+            k = os.getenv("TWELVE_DATA_KEY", "").strip()
+            if k:
+                keys.append(k)
+        if keys:
+            logger.info(f"TwelveDataKeyManager: {len(keys)} API key(s) loaded.")
+        else:
+            logger.warning("TwelveDataKeyManager: no API keys found — will use synthetic data.")
+        return keys
+
+    @property
+    def active_key(self) -> str:
+        if not self.keys:
+            return ""
+        return self.keys[self.current_idx]
+
+    @property
+    def has_keys(self) -> bool:
+        return bool(self.keys) and len(self.exhausted) < len(self.keys)
+
+    def rotate(self, reason: str = "rate limit"):
+        """Mark current key as exhausted and switch to the next available one."""
+        self.exhausted.add(self.current_idx)
+        available = [i for i in range(len(self.keys)) if i not in self.exhausted]
+
+        if not available:
+            logger.error(
+                f"All {len(self.keys)} Twelve Data key(s) exhausted ({reason}). "
+                f"Falling back to synthetic data until midnight UTC reset."
+            )
+            return
+
+        self.current_idx = available[0]
+        logger.warning(
+            f"Twelve Data key rotated ({reason}). "
+            f"Now on key #{self.current_idx + 1}. "
+            f"{len(available) - 1} backup key(s) still available."
+        )
+
+    def reset_daily(self):
+        """Call at midnight UTC — Twelve Data resets quotas daily."""
+        self.exhausted   = set()
+        self.current_idx = 0
+        logger.info("TwelveDataKeyManager: daily reset — all keys active again.")
+
+    def is_rate_limit(self, data: dict, status_code: int) -> bool:
+        """Detect rate limit from HTTP status or API response body."""
+        if status_code == 429:
+            return True
+        if data.get("status") == "error":
+            msg = data.get("message", "").lower()
+            if any(x in msg for x in ["api credits", "rate limit", "too many",
+                                       "exceeded", "limit reached", "upgrade"]):
+                return True
+        return False
+
+
+# Singleton — shared across all fetch calls in this process
+_key_manager = TwelveDataKeyManager()
+
+def get_key_manager() -> TwelveDataKeyManager:
+    return _key_manager
+
+
+# ---------------------------------------------------------------------------
+# OHLC fetch — Twelve Data with key rotation, synthetic fallback
+# ---------------------------------------------------------------------------
+
+def _fetch_twelve_data(asset: str, timeframe: str) -> pd.DataFrame:
+    """
+    Fetch from Twelve Data. Rotates to backup key on rate limit.
+    """
     TD_INTERVAL = {"M1": "1min", "M5": "5min", "M15": "15min"}
     interval = TD_INTERVAL[timeframe]
-    
-    # Twelve Data expects format like "EUR/USD", "XAU/USD", or "BTC/USD"
+
     if asset == "XAUUSD":
         symbol = "XAU/USD"
     elif asset == "BTCUSD":
         symbol = "BTC/USD"
     else:
-        # EURUSD -> EUR/USD, GBPUSD -> GBP/USD, USDJPY -> USD/JPY
         symbol = f"{asset[:3]}/{asset[3:]}"
-    
-    url = (
-        f"https://api.twelvedata.com/time_series"
-        f"?symbol={symbol}"
-        f"&interval={interval}"
-        f"&outputsize=200"
-        f"&apikey={api_key}"
-    )
-    
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    
-    # Check for API errors
-    if "status" in data and data["status"] == "error":
-        raise ValueError(f"Twelve Data error: {data.get('message', 'Unknown error')}")
-    
-    if "values" not in data or not data["values"]:
-        raise ValueError(f"No data returned from Twelve Data for {asset}")
-    
-    rows = []
-    for vals in data["values"]:
-        rows.append({
-            "timestamp": pd.to_datetime(vals["datetime"]),
-            "open":  float(vals["open"]),
-            "high":  float(vals["high"]),
-            "low":   float(vals["low"]),
-            "close": float(vals["close"]),
-            "volume": float(vals.get("volume", 0)),
-        })
-    
-    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
-    return df
+
+    km          = get_key_manager()
+    max_retries = len(km.keys) if km.keys else 1
+
+    for attempt in range(max_retries):
+        if not km.has_keys:
+            raise ValueError("All Twelve Data API keys exhausted.")
+
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}"
+            f"&interval={interval}"
+            f"&outputsize=200"
+            f"&apikey={km.active_key}"
+        )
+
+        try:
+            resp = requests.get(url, timeout=15)
+
+            # HTTP 429 — rotate immediately and retry
+            if resp.status_code == 429:
+                logger.warning(f"Key #{km.current_idx + 1} HTTP 429. Rotating...")
+                km.rotate("HTTP 429")
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            # API-level rate limit error — rotate and retry
+            if km.is_rate_limit(data, resp.status_code):
+                logger.warning(
+                    f"Key #{km.current_idx + 1} limit: {data.get('message', '')}. Rotating..."
+                )
+                km.rotate(data.get("message", "limit"))
+                continue
+
+            if data.get("status") == "error":
+                raise ValueError(f"Twelve Data error: {data.get('message', 'unknown')}")
+
+            if "values" not in data or not data["values"]:
+                raise ValueError(f"No data returned from Twelve Data for {asset}")
+
+            rows = []
+            for vals in data["values"]:
+                rows.append({
+                    "timestamp": pd.to_datetime(vals["datetime"]),
+                    "open":      float(vals["open"]),
+                    "high":      float(vals["high"]),
+                    "low":       float(vals["low"]),
+                    "close":     float(vals["close"]),
+                    "volume":    float(vals.get("volume", 0)),
+                })
+
+            df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+            logger.info(
+                f"Fetched {len(df)} candles for {asset} {timeframe} "
+                f"from Twelve Data (key #{km.current_idx + 1})."
+            )
+            return df
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            logger.warning(f"Network error for {asset}/{timeframe}: {exc}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            continue
+
+    raise ValueError(f"All fetch attempts failed for {asset}/{timeframe}")
 
 
 def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
@@ -150,20 +276,20 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
     rng  = np.random.default_rng(seed)
 
     base_prices = {
-        "EURUSD": 1.0850, 
-        "GBPUSD": 1.2700, 
+        "EURUSD": 1.0850,
+        "GBPUSD": 1.2700,
         "XAUUSD": 2350.0,
         "USDJPY": 150.0,
         "BTCUSD": 65000.0,
     }
     base = base_prices.get(asset, 1.0)
     sigma = {
-        "EURUSD": 0.0003, 
-        "GBPUSD": 0.0004, 
+        "EURUSD": 0.0003,
+        "GBPUSD": 0.0004,
         "XAUUSD": 0.8,
         "USDJPY": 0.05,
         "BTCUSD": 500.0,
-    }[asset]
+    }.get(asset, 0.0003)
 
     minutes = TF_MINUTES[timeframe]
     now     = datetime.utcnow().replace(second=0, microsecond=0)
@@ -174,13 +300,13 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
 
     rows = []
     for i, (ts, close) in enumerate(zip(timestamps, closes)):
-        open_       = closes[i - 1] if i > 0 else close
-        body        = abs(open_ - close)
-        upper_wick  = abs(rng.normal(0, max(body * 1.2, sigma * 0.8)))
-        lower_wick  = abs(rng.normal(0, max(body * 1.2, sigma * 0.8)))
-        high        = max(open_, close) + upper_wick
-        low         = min(open_, close) - lower_wick
-        volume      = rng.integers(200, 1000)
+        open_      = closes[i - 1] if i > 0 else close
+        body       = abs(open_ - close)
+        upper_wick = abs(rng.normal(0, max(body * 1.2, sigma * 0.8)))
+        lower_wick = abs(rng.normal(0, max(body * 1.2, sigma * 0.8)))
+        high       = max(open_, close) + upper_wick
+        low        = min(open_, close) - lower_wick
+        volume     = rng.integers(200, 1000)
         rows.append({"timestamp": ts, "open": open_, "high": high,
                      "low": low, "close": close, "volume": volume})
 
@@ -190,13 +316,12 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
 def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
     """
     Primary fetch function.
-    Tries Twelve Data if API key is set, else falls back to synthetic data.
+    Tries Twelve Data (with key rotation) first, falls back to synthetic data.
     """
-    api_key = os.getenv("TWELVE_DATA_KEY", "")
-    if api_key and api_key != "demo":
+    km = get_key_manager()
+    if km.has_keys:
         try:
-            df = _fetch_twelve_data(asset, timeframe, api_key)
-            logger.info(f"Fetched {len(df)} candles for {asset} {timeframe} from Twelve Data.")
+            df = _fetch_twelve_data(asset, timeframe)
             return df.tail(n_candles).reset_index(drop=True)
         except Exception as exc:
             logger.warning(f"Twelve Data fetch failed ({exc}), using synthetic data.")
@@ -263,7 +388,7 @@ def refresh_all():
                 store_ohlc(asset, tf, df)
             except Exception as exc:
                 logger.error(f"refresh_all failed for {asset}/{tf}: {exc}")
-            time.sleep(0.5)   # polite rate limiting
+            time.sleep(0.5)
 
 
 if __name__ == "__main__":
