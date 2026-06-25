@@ -9,7 +9,7 @@ A signal is only emitted when ALL conditions are satisfied:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import pandas as pd
@@ -23,7 +23,8 @@ from filter_engine import apply_filters, get_current_session
 
 logger = logging.getLogger(__name__)
 
-MAX_DAILY_SIGNALS = 20
+MAX_DAILY_SIGNALS    = 20
+SIGNAL_COOLDOWN_MINS = 5   # don't resend same asset/timeframe/direction within 5 mins
 
 # ---------------------------------------------------------------------------
 # Signal dataclass
@@ -89,12 +90,11 @@ class Signal:
 
 
 # ---------------------------------------------------------------------------
-# Daily counter
+# Daily counter + deduplication cache
 # ---------------------------------------------------------------------------
 
-_daily_counts: dict = {}
-_last_signal_bar: dict = {}
-SIGNAL_COOLDOWN_BARS = 3
+_daily_counts: dict  = {}
+_last_emitted: dict  = {}   # key: "ASSET/TF/DIR" → last emit datetime
 
 def _daily_count_key(asset: str, dt: datetime) -> str:
     return f"{asset}:{dt.strftime('%Y-%m-%d')}"
@@ -108,9 +108,26 @@ def _get_count(asset: str, dt: datetime) -> int:
     key = _daily_count_key(asset, dt)
     return _daily_counts.get(key, 0)
 
+def _is_duplicate(asset: str, timeframe: str, direction: str, dt: datetime) -> bool:
+    """Returns True if same signal was emitted within SIGNAL_COOLDOWN_MINS."""
+    key      = f"{asset}/{timeframe}/{direction}"
+    last     = _last_emitted.get(key)
+    if last and (dt - last) < timedelta(minutes=SIGNAL_COOLDOWN_MINS):
+        logger.info(
+            f"⛔ {asset}/{timeframe}: DUPLICATE blocked — "
+            f"{direction} already sent {(dt - last).seconds // 60}m ago "
+            f"(cooldown={SIGNAL_COOLDOWN_MINS}m)"
+        )
+        return True
+    return False
+
+def _mark_emitted(asset: str, timeframe: str, direction: str, dt: datetime):
+    key = f"{asset}/{timeframe}/{direction}"
+    _last_emitted[key] = dt
+
 
 # ---------------------------------------------------------------------------
-# Core signal generation — with per-gate INFO logging
+# Core signal generation
 # ---------------------------------------------------------------------------
 
 def generate_signal(
@@ -121,7 +138,7 @@ def generate_signal(
     spread_pct: float = 0.0,
 ) -> Optional[Signal]:
 
-    dt = dt or datetime.utcnow()
+    dt  = dt or datetime.utcnow()
     tag = f"{asset}/{timeframe}"
 
     # --- Daily cap
@@ -146,7 +163,7 @@ def generate_signal(
 
     entry_price = float(df["close"].iloc[-1])
 
-    # ---- Gate 1: Indicators (needed for filter) ----
+    # ---- Gate 1: Indicators ----
     ind = compute_indicators(df)
 
     # ---- Gate 2: Filters ----
@@ -216,7 +233,11 @@ def generate_signal(
         )
         return None
 
-    # ---- Gate 7: AI confidence ----
+    # ---- Gate 7: Duplicate check ----
+    if _is_duplicate(asset, timeframe, direction, dt):
+        return None
+
+    # ---- Gate 8: AI confidence ----
     features = build_features(
         rsi=ind.rsi,
         macd_hist=ind.macd_hist,
@@ -285,6 +306,8 @@ def generate_signal(
     )
 
     _increment_count(asset, dt)
+    _mark_emitted(asset, timeframe, direction, dt)
+
     logger.info(
         f"✅ SIGNAL EMITTED: {asset}/{timeframe} {direction} "
         f"conf={ai_score.confidence:.1f}% entry={entry_price:.5f}"
@@ -317,7 +340,7 @@ def scan_all(dt: Optional[datetime] = None, spread_pcts: dict = {}) -> List[Sign
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Direction resolver
 # ---------------------------------------------------------------------------
 
 def _resolve_direction_verbose(
@@ -325,54 +348,53 @@ def _resolve_direction_verbose(
     ind: IndicatorResult,
     pa: PriceActionResult,
 ) -> Tuple[Optional[str], dict]:
-    """Returns (direction, votes_dict) for logging."""
     votes = {"CALL": 0, "PUT": 0}
 
-    # --- Structure votes (split so both directions are equally reachable) ---
+    # Structure votes
     if struct.trend == "bullish":
         if struct.at_support:
-            votes["CALL"] += 3   # price bouncing off support in uptrend
+            votes["CALL"] += 3
         if struct.pullback:
-            votes["CALL"] += 2   # pullback in uptrend = buy dip
+            votes["CALL"] += 2
     elif struct.trend == "bearish":
         if struct.at_resistance:
-            votes["PUT"] += 3    # price rejected at resistance in downtrend
+            votes["PUT"] += 3
         if struct.pullback:
-            votes["PUT"] += 2    # pullback in downtrend = sell rally
+            votes["PUT"] += 2
 
-    # --- Breakout votes ---
+    # Breakout votes
     if struct.breakout == "bullish_break":
         votes["CALL"] += 2
     elif struct.breakout == "bearish_break":
         votes["PUT"]  += 2
 
-    # --- EMA trend — reduced weight to avoid long-term uptrend bias ---
+    # EMA trend (reduced weight)
     if ind.ema_trend == "bullish":
-        votes["CALL"] += 1   # was 2, reduced to 1
+        votes["CALL"] += 1
     elif ind.ema_trend == "bearish":
-        votes["PUT"]  += 1   # was 2, reduced to 1
+        votes["PUT"]  += 1
 
-    # --- RSI — increased weight, added neutral zone scoring ---
+    # RSI
     if ind.rsi_zone == "oversold":
-        votes["CALL"] += 2   # was 1, increased — strong reversal signal
+        votes["CALL"] += 2
     elif ind.rsi_zone == "overbought":
-        votes["PUT"]  += 2   # was 1, increased — strong reversal signal
+        votes["PUT"]  += 2
     elif ind.rsi > 55:
-        votes["CALL"] += 1   # mild bullish momentum (new)
+        votes["CALL"] += 1
     elif ind.rsi < 45:
-        votes["PUT"]  += 1   # mild bearish momentum (new)
+        votes["PUT"]  += 1
 
-    # --- MACD — added histogram scoring for when no cross yet ---
+    # MACD
     if ind.macd_cross == "bullish":
         votes["CALL"] += 2
     elif ind.macd_cross == "bearish":
         votes["PUT"]  += 2
     elif ind.macd_hist > 0:
-        votes["CALL"] += 1   # building bullish momentum (new)
+        votes["CALL"] += 1
     elif ind.macd_hist < 0:
-        votes["PUT"]  += 1   # building bearish momentum (new)
+        votes["PUT"]  += 1
 
-    # --- Price action votes ---
+    # Price action
     if pa.dominant_pattern:
         if pa.dominant_pattern.direction == "bullish":
             votes["CALL"] += int(pa.dominant_pattern.strength * 3)
@@ -391,7 +413,6 @@ def _resolve_direction_verbose(
     return None, votes
 
 
-# Keep old name for backtester compatibility
 def _resolve_direction(struct, ind, pa):
     direction, _ = _resolve_direction_verbose(struct, ind, pa)
     return direction
