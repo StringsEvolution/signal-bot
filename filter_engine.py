@@ -36,20 +36,18 @@ class NewsEvent:
 # Session filter
 # ---------------------------------------------------------------------------
 
-DEAD_HOURS_UTC = list(range(22, 24)) + list(range(0, 7))   # 22:00–07:00 UTC
+DEAD_HOURS_UTC = list(range(22, 24)) + list(range(0, 7))
 
-# Allowed trading windows (UTC hours)
 TRADING_WINDOWS = {
-    "london":     (7,  16),
-    "new_york":   (13, 22),
-    "overlap":    (13, 16),
+    "london":   (7,  16),
+    "new_york": (13, 22),
+    "overlap":  (13, 16),
 }
 
 
 def get_current_session(dt: Optional[datetime] = None) -> str:
     dt = dt or datetime.utcnow()
     h  = dt.hour
-
     if 13 <= h < 16:
         return "London/NY Overlap"
     if 7 <= h < 13:
@@ -66,18 +64,37 @@ def is_dead_session(dt: Optional[datetime] = None) -> bool:
 
 def is_weekend(dt: Optional[datetime] = None) -> bool:
     dt = dt or datetime.utcnow()
-    return dt.weekday() >= 5   # Saturday=5, Sunday=6
+    return dt.weekday() >= 5
 
 
 # ---------------------------------------------------------------------------
-# News filter — fetches from ForexFactory-compatible public APIs
+# Volatility thresholds — timeframe-aware
 # ---------------------------------------------------------------------------
 
-# Hard-coded upcoming high-impact events (supplemented by live fetch)
-MANUAL_HIGH_IMPACT = [
-    # format: (month, day, hour_utc, minute, currencies, title)
-    # Add known scheduled events here as backup
-]
+# Shorter timeframes have smaller candles so ATR% is naturally lower.
+# Each value is the MINIMUM ATR% required to pass the volatility filter.
+ATR_THRESHOLD = {
+    "M1":  0.015,   # was 0.03 for all — M1 candles are tiny, lower threshold
+    "M2":  0.012,   # M2/M3 even smaller candles, needs lower threshold
+    "M3":  0.012,
+    "M5":  0.03,    # original threshold — unchanged
+    "M15": 0.03,    # original threshold — unchanged
+}
+
+DEFAULT_ATR_THRESHOLD = 0.03   # fallback for any unrecognised timeframe
+
+
+def is_low_volatility(atr_pct: float, timeframe: str = "M5") -> bool:
+    """ATR below timeframe-specific threshold = dead market."""
+    threshold = ATR_THRESHOLD.get(timeframe, DEFAULT_ATR_THRESHOLD)
+    return atr_pct < threshold
+
+
+# ---------------------------------------------------------------------------
+# News filter
+# ---------------------------------------------------------------------------
+
+MANUAL_HIGH_IMPACT = []
 
 _news_cache: List[NewsEvent] = []
 _news_cache_ts: Optional[datetime] = None
@@ -85,13 +102,8 @@ NEWS_CACHE_TTL_MIN = 60
 
 
 def _fetch_news_events() -> List[NewsEvent]:
-    """
-    Fetch upcoming high-impact news from a public ForexFactory JSON mirror or fallback.
-    Returns empty list on failure (safe default — do not block on API issues).
-    """
     events = []
     try:
-        # Try marketaux free-tier economic calendar
         api_key = os.getenv("MARKETAUX_KEY", "")
         if api_key:
             url = (
@@ -111,22 +123,18 @@ def _fetch_news_events() -> List[NewsEvent]:
     except Exception as exc:
         logger.debug(f"News fetch failed: {exc}")
 
-    # Fallback: known weekly high-impact windows (conservative)
-    # NFP = first Friday of month at 13:30 UTC
     now = datetime.utcnow()
-    first_friday = _first_weekday_of_month(now.year, now.month, 4)   # 4=Friday
+    first_friday = _first_weekday_of_month(now.year, now.month, 4)
     nfp_dt = datetime(now.year, now.month, first_friday, 13, 30)
     events.append(NewsEvent("NFP", nfp_dt, "USD", "High"))
 
-    # CPI usually 2nd Tuesday/Wednesday of month at 13:30 UTC
-    cpi_day = _nth_weekday(now.year, now.month, 2, 1)   # 2nd Tuesday
+    cpi_day = _nth_weekday(now.year, now.month, 2, 1)
     events.append(NewsEvent("CPI", datetime(now.year, now.month, cpi_day, 13, 30), "USD", "High"))
 
     return events
 
 
 def _first_weekday_of_month(year: int, month: int, weekday: int) -> int:
-    """Return day-of-month for first occurrence of weekday (0=Mon … 6=Sun)."""
     import calendar
     cal = calendar.monthcalendar(year, month)
     for week in cal:
@@ -137,7 +145,6 @@ def _first_weekday_of_month(year: int, month: int, weekday: int) -> int:
 
 def _nth_weekday(year: int, month: int, n: int, weekday: int) -> int:
     count = 0
-    import calendar
     for day in range(1, 32):
         try:
             dt = datetime(year, month, day)
@@ -160,12 +167,8 @@ def get_news_events() -> List[NewsEvent]:
 
 
 def is_near_news(asset: str, dt: Optional[datetime] = None, window_min: int = 30) -> Tuple[bool, str]:
-    """
-    Return (True, event_title) if there is a high-impact event within ±window_min of dt.
-    Asset currencies are mapped to events (e.g. EURUSD blocks EUR and USD events).
-    """
-    dt       = dt or datetime.utcnow()
-    events   = get_news_events()
+    dt     = dt or datetime.utcnow()
+    events = get_news_events()
     asset_currencies = set()
 
     if len(asset) == 6:
@@ -180,10 +183,8 @@ def is_near_news(asset: str, dt: Optional[datetime] = None, window_min: int = 30
             continue
         if ev.currency and ev.currency not in asset_currencies and asset_currencies:
             continue
-        # Make both timezone-naive for comparison
-        ev_dt = ev.datetime.replace(tzinfo=None) if ev.datetime.tzinfo else ev.datetime
+        ev_dt  = ev.datetime.replace(tzinfo=None) if ev.datetime.tzinfo else ev.datetime
         dt_cmp = dt.replace(tzinfo=None) if dt.tzinfo else dt
-
         if abs(ev_dt - dt_cmp) <= window:
             return True, ev.title
 
@@ -191,21 +192,12 @@ def is_near_news(asset: str, dt: Optional[datetime] = None, window_min: int = 30
 
 
 # ---------------------------------------------------------------------------
-# Spread / volatility filter
+# Spread filter
 # ---------------------------------------------------------------------------
 
-def is_low_volatility(atr_pct: float) -> bool:
-    """ATR < 0.03% of price is considered dead market (adjusted for all assets)."""
-    return atr_pct < 0.03
-
-
 def is_high_spread(asset: str, spread_pct: float) -> bool:
-    """
-    Typical max acceptable spread as % of price per asset.
-    Adjust thresholds based on your broker.
-    """
     MAX_SPREAD = {
-        "EURUSD": 0.01,   # 1 pip
+        "EURUSD": 0.01,
         "GBPUSD": 0.015,
         "XAUUSD": 0.05,
     }
@@ -225,9 +217,6 @@ def apply_filters(
     dt: Optional[datetime] = None,
     spread_pct: float = 0.0,
 ) -> FilterResult:
-    """
-    Run all filters. Returns FilterResult with allowed=True/False and reasons.
-    """
     result = FilterResult()
     dt     = dt or datetime.utcnow()
 
@@ -250,10 +239,13 @@ def apply_filters(
         result.reasons.append(f"High-impact news risk: {news_title} (±30 min window)")
         return result
 
-    # 4. Low volatility
-    if is_low_volatility(atr_pct):
+    # 4. Low volatility — now timeframe-aware
+    if is_low_volatility(atr_pct, timeframe):
+        threshold = ATR_THRESHOLD.get(timeframe, DEFAULT_ATR_THRESHOLD)
         result.allowed = False
-        result.reasons.append(f"Low volatility (ATR% = {atr_pct:.4f}%) — market inactive")
+        result.reasons.append(
+            f"Low volatility (ATR% = {atr_pct:.4f}% < {threshold:.3f}% threshold for {timeframe}) — market inactive"
+        )
         return result
 
     # 5. Ranging structure
@@ -262,7 +254,7 @@ def apply_filters(
         result.reasons.append("Market is ranging — no clear directional bias")
         return result
 
-    # 6. Spread (if provided)
+    # 6. Spread
     if spread_pct > 0 and is_high_spread(asset, spread_pct):
         result.allowed = False
         result.reasons.append(f"High spread: {spread_pct:.4f}% exceeds threshold for {asset}")
