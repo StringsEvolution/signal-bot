@@ -5,7 +5,7 @@ A signal is only emitted when ALL conditions are satisfied:
   2. Market structure confirmed
   3. Price action pattern detected
   4. Direction resolved (votes decisive)
-  5. AI confidence > 80%
+  5. AI confidence > timeframe threshold
 """
 
 import logging
@@ -18,13 +18,13 @@ from data_engine import fetch_ohlc, store_ohlc, load_ohlc, TF_EXPIRY, ASSETS, TI
 from market_structure import analyse_structure, StructureResult
 from indicators import compute_indicators, IndicatorResult
 from price_action import analyse_price_action, PriceActionResult
-from ai_model import build_features, get_ai_engine, AIScore, CONFIDENCE_THRESHOLD
+from ai_model import build_features, get_ai_engine, AIScore, CONFIDENCE_THRESHOLD, get_confidence_threshold
 from filter_engine import apply_filters, get_current_session
 
 logger = logging.getLogger(__name__)
 
 MAX_DAILY_SIGNALS    = 20
-SIGNAL_COOLDOWN_MINS = 5   # don't resend same asset/timeframe/direction within 5 mins
+SIGNAL_COOLDOWN_MINS = 5
 
 # ---------------------------------------------------------------------------
 # Signal dataclass
@@ -90,11 +90,11 @@ class Signal:
 
 
 # ---------------------------------------------------------------------------
-# Daily counter + deduplication cache
+# Daily counter + deduplication
 # ---------------------------------------------------------------------------
 
-_daily_counts: dict  = {}
-_last_emitted: dict  = {}   # key: "ASSET/TF/DIR" → last emit datetime
+_daily_counts: dict = {}
+_last_emitted: dict = {}
 
 def _daily_count_key(asset: str, dt: datetime) -> str:
     return f"{asset}:{dt.strftime('%Y-%m-%d')}"
@@ -109,9 +109,8 @@ def _get_count(asset: str, dt: datetime) -> int:
     return _daily_counts.get(key, 0)
 
 def _is_duplicate(asset: str, timeframe: str, direction: str, dt: datetime) -> bool:
-    """Returns True if same signal was emitted within SIGNAL_COOLDOWN_MINS."""
-    key      = f"{asset}/{timeframe}/{direction}"
-    last     = _last_emitted.get(key)
+    key  = f"{asset}/{timeframe}/{direction}"
+    last = _last_emitted.get(key)
     if last and (dt - last) < timedelta(minutes=SIGNAL_COOLDOWN_MINS):
         logger.info(
             f"⛔ {asset}/{timeframe}: DUPLICATE blocked — "
@@ -122,8 +121,7 @@ def _is_duplicate(asset: str, timeframe: str, direction: str, dt: datetime) -> b
     return False
 
 def _mark_emitted(asset: str, timeframe: str, direction: str, dt: datetime):
-    key = f"{asset}/{timeframe}/{direction}"
-    _last_emitted[key] = dt
+    _last_emitted[f"{asset}/{timeframe}/{direction}"] = dt
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +138,9 @@ def generate_signal(
 
     dt  = dt or datetime.utcnow()
     tag = f"{asset}/{timeframe}"
+
+    # Timeframe-aware confidence threshold
+    tf_threshold = get_confidence_threshold(timeframe)
 
     # --- Daily cap
     if _get_count(asset, dt) >= MAX_DAILY_SIGNALS:
@@ -262,25 +263,26 @@ def generate_signal(
     logger.info(
         f"🤖 {tag}: AI dir={ai_score.direction} conf={ai_score.confidence:.1f}% "
         f"P(UP)={ai_score.prob_up:.2f} P(DN)={ai_score.prob_down:.2f} "
-        f"threshold={CONFIDENCE_THRESHOLD}% passes={ai_score.passes_threshold}"
+        f"threshold={tf_threshold:.0f}% passes={ai_score.confidence >= tf_threshold}"
     )
 
     # Direction consistency check
     if ai_score.direction != direction:
-        matching_prob = ai_score.prob_up if direction == "CALL" else ai_score.prob_down
+        matching_prob  = ai_score.prob_up if direction == "CALL" else ai_score.prob_down
+        min_prob       = 0.55 if timeframe in ("M1", "M2", "M3") else 0.60
         logger.info(
             f"⚠️  {tag}: AI direction conflict "
             f"(AI={ai_score.direction} struct={direction}) "
             f"matching_prob={matching_prob:.2f}"
         )
-        if matching_prob < 0.60:
-            logger.info(f"⛔ {tag}: AI CONFLICT blocked — matching_prob {matching_prob:.2f} < 0.60")
+        if matching_prob < min_prob:
+            logger.info(f"⛔ {tag}: AI CONFLICT blocked — matching_prob {matching_prob:.2f} < {min_prob}")
             return None
 
-    if not ai_score.passes_threshold:
+    if ai_score.confidence < tf_threshold:
         logger.info(
             f"⛔ {tag}: AI CONFIDENCE blocked — "
-            f"{ai_score.confidence:.1f}% < {CONFIDENCE_THRESHOLD}%"
+            f"{ai_score.confidence:.1f}% < {tf_threshold:.0f}% threshold for {timeframe}"
         )
         return None
 
@@ -350,51 +352,29 @@ def _resolve_direction_verbose(
 ) -> Tuple[Optional[str], dict]:
     votes = {"CALL": 0, "PUT": 0}
 
-    # Structure votes
     if struct.trend == "bullish":
-        if struct.at_support:
-            votes["CALL"] += 3
-        if struct.pullback:
-            votes["CALL"] += 2
+        if struct.at_support:  votes["CALL"] += 3
+        if struct.pullback:    votes["CALL"] += 2
     elif struct.trend == "bearish":
-        if struct.at_resistance:
-            votes["PUT"] += 3
-        if struct.pullback:
-            votes["PUT"] += 2
+        if struct.at_resistance: votes["PUT"] += 3
+        if struct.pullback:      votes["PUT"] += 2
 
-    # Breakout votes
-    if struct.breakout == "bullish_break":
-        votes["CALL"] += 2
-    elif struct.breakout == "bearish_break":
-        votes["PUT"]  += 2
+    if struct.breakout == "bullish_break": votes["CALL"] += 2
+    elif struct.breakout == "bearish_break": votes["PUT"] += 2
 
-    # EMA trend (reduced weight)
-    if ind.ema_trend == "bullish":
-        votes["CALL"] += 1
-    elif ind.ema_trend == "bearish":
-        votes["PUT"]  += 1
+    if ind.ema_trend == "bullish":  votes["CALL"] += 1
+    elif ind.ema_trend == "bearish": votes["PUT"]  += 1
 
-    # RSI
-    if ind.rsi_zone == "oversold":
-        votes["CALL"] += 2
-    elif ind.rsi_zone == "overbought":
-        votes["PUT"]  += 2
-    elif ind.rsi > 55:
-        votes["CALL"] += 1
-    elif ind.rsi < 45:
-        votes["PUT"]  += 1
+    if ind.rsi_zone == "oversold":    votes["CALL"] += 2
+    elif ind.rsi_zone == "overbought": votes["PUT"]  += 2
+    elif ind.rsi > 55: votes["CALL"] += 1
+    elif ind.rsi < 45: votes["PUT"]  += 1
 
-    # MACD
-    if ind.macd_cross == "bullish":
-        votes["CALL"] += 2
-    elif ind.macd_cross == "bearish":
-        votes["PUT"]  += 2
-    elif ind.macd_hist > 0:
-        votes["CALL"] += 1
-    elif ind.macd_hist < 0:
-        votes["PUT"]  += 1
+    if ind.macd_cross == "bullish":  votes["CALL"] += 2
+    elif ind.macd_cross == "bearish": votes["PUT"]  += 2
+    elif ind.macd_hist > 0: votes["CALL"] += 1
+    elif ind.macd_hist < 0: votes["PUT"]  += 1
 
-    # Price action
     if pa.dominant_pattern:
         if pa.dominant_pattern.direction == "bullish":
             votes["CALL"] += int(pa.dominant_pattern.strength * 3)
