@@ -68,7 +68,7 @@ def _check_engulfing(curr: pd.Series, prev: pd.Series) -> Optional[CandlePattern
     if (_is_bearish(prev) and _is_bullish(curr)
             and curr["open"] < prev["close"]
             and curr["close"] > prev["open"]
-            and curr_body > prev_body * 0.9):
+            and curr_body > prev_body * 0.7):
         strength = min(curr_body / prev_body, 1.0) if prev_body > 0 else 0.5
         return CandlePattern("Bullish Engulfing", "bullish", round(strength, 2),
                               "Bearish candle followed by larger bullish candle")
@@ -76,7 +76,7 @@ def _check_engulfing(curr: pd.Series, prev: pd.Series) -> Optional[CandlePattern
     if (_is_bullish(prev) and _is_bearish(curr)
             and curr["open"] > prev["close"]
             and curr["close"] < prev["open"]
-            and curr_body > prev_body * 0.9):
+            and curr_body > prev_body * 0.7):
         strength = min(curr_body / prev_body, 1.0) if prev_body > 0 else 0.5
         return CandlePattern("Bearish Engulfing", "bearish", round(strength, 2),
                               "Bullish candle followed by larger bearish candle")
@@ -103,15 +103,15 @@ def _check_pin_bar(candle: pd.Series) -> Optional[CandlePattern]:
     upper_ratio = upper / total
     lower_ratio = lower / total
 
-    if body_ratio > 0.35:
+    if body_ratio > 0.45:
         return None
 
-    if lower_ratio >= 0.60 and upper_ratio <= 0.20:
+    if lower_ratio >= 0.55 and upper_ratio <= 0.25:
         strength = round(lower_ratio, 2)
         return CandlePattern("Bullish Pin Bar", "bullish", strength,
                               f"Long lower wick ({lower_ratio:.0%}) rejecting bearish pressure")
 
-    if upper_ratio >= 0.60 and lower_ratio <= 0.20:
+    if upper_ratio >= 0.55 and lower_ratio <= 0.25:
         strength = round(upper_ratio, 2)
         return CandlePattern("Bearish Pin Bar", "bearish", strength,
                               f"Long upper wick ({upper_ratio:.0%}) rejecting bullish pressure")
@@ -153,14 +153,14 @@ def _check_rejection_candle(candle: pd.Series) -> Optional[CandlePattern]:
     upper_ratio = upper / total
     lower_ratio = lower / total
 
-    if body_ratio < 0.50:
+    if body_ratio < 0.40:
         return None
 
-    if _is_bullish(candle) and lower_ratio >= 0.20 and upper_ratio <= 0.15:
+    if _is_bullish(candle) and lower_ratio >= 0.15 and upper_ratio <= 0.20:
         return CandlePattern("Bullish Rejection", "bullish", round(body_ratio, 2),
                               "Strong bullish close with lower wick rejection")
 
-    if _is_bearish(candle) and upper_ratio >= 0.20 and lower_ratio <= 0.15:
+    if _is_bearish(candle) and upper_ratio >= 0.15 and lower_ratio <= 0.20:
         return CandlePattern("Bearish Rejection", "bearish", round(body_ratio, 2),
                               "Strong bearish close with upper wick rejection")
 
