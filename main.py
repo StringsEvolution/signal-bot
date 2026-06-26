@@ -2,8 +2,8 @@
 Main Orchestrator
 Runs the signal bot in a loop:
   - Refresh OHLC data every minute
-  - Scan for signals on every refresh
-  - Send qualifying signals to Telegram
+  - Scan IMMEDIATELY after refresh completes (fresh data)
+  - Send qualifying signals to Telegram instantly
   - Generate daily/weekly reports on schedule
   - Poll Telegram for bot commands
   - Reset Twelve Data API keys at midnight UTC
@@ -19,7 +19,7 @@ import sys
 import time
 import logging
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -35,7 +35,14 @@ logger = logging.getLogger("main")
 
 
 def run_live_bot():
-    """Main loop: data refresh → scan → Telegram → sleep."""
+    """
+    Main loop flow:
+      1. Refresh OHLC data (parallel, ~45s)
+      2. Scan for signals IMMEDIATELY after refresh — freshest data
+      3. Send signals to Telegram instantly
+      4. Sleep only the remaining time to fill 60s cycle
+      5. Repeat
+    """
     from data_engine   import init_db, refresh_all, get_key_manager
     from signal_engine import scan_all
     from telegram_bot  import send_signal, send_admin_alert, BotCommandHandler
@@ -48,64 +55,76 @@ def run_live_bot():
     init_db()
     send_admin_alert("🚀 Signal Bot Pro is now online and scanning markets.")
 
-    cmd_handler        = BotCommandHandler()
-    cmd_handler.start()   # launches background thread — commands respond instantly
-    last_data_refresh  = datetime.min
-    last_daily_report  = datetime.min
-    last_weekly_report = datetime.min
-    last_midnight_reset = datetime.min
+    cmd_handler = BotCommandHandler()
+    cmd_handler.start()
 
-    SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_SEC",    "60"))
-    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL_SEC", "60"))
+    last_daily_report  = datetime.now(timezone.utc)
+    last_weekly_report = datetime.now(timezone.utc)
+    last_midnight_reset = datetime.now(timezone.utc)
+
+    CYCLE_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 
     while True:
-        try:
-            now = datetime.utcnow()
+        cycle_start = datetime.now(timezone.utc)
 
-            # 1. Midnight reset — Twelve Data quotas refresh at 00:00 UTC
+        try:
+            now = cycle_start
+
+            # 1. Midnight reset
             if now.hour == 0 and now.minute == 0 and (now - last_midnight_reset).seconds > 3600:
                 get_key_manager().reset_daily()
                 last_midnight_reset = now
                 logger.info("Midnight UTC — Twelve Data API keys reset.")
 
-            # 2. Refresh OHLC data
-            if (now - last_data_refresh).seconds >= REFRESH_INTERVAL:
-                logger.info("Refreshing OHLC data...")
-                try:
-                    refresh_all()
-                    last_data_refresh = now
-                except Exception as exc:
-                    logger.error(f"Data refresh failed: {exc}")
+            # 2. Refresh OHLC data — fetch all pairs in parallel
+            logger.info("Refreshing OHLC data...")
+            try:
+                refresh_all()
+            except Exception as exc:
+                logger.error(f"Data refresh failed: {exc}")
 
-            # 3. Scan for signals
+            # 3. Scan IMMEDIATELY after refresh — data is as fresh as possible
+            scan_time = datetime.now(timezone.utc)
             logger.info("Scanning for signals...")
-            signals = scan_all(dt=now)
+            signals = scan_all(dt=scan_time)
 
-            for sig in signals:
-                logger.info(f"  → SIGNAL: {sig.asset}/{sig.timeframe} {sig.direction} conf={sig.confidence:.0f}%")
-                send_signal(sig)
-
-            if not signals:
+            # 4. Send signals INSTANTLY — no delay between scan and send
+            if signals:
+                for sig in signals:
+                    logger.info(f"  → SIGNAL: {sig.asset}/{sig.timeframe} {sig.direction} conf={sig.confidence:.0f}%")
+                    send_signal(sig)
+            else:
                 logger.info("  No qualifying signals this scan.")
 
-            # 4. Daily report at 22:00 UTC
-            if now.hour == 22 and (now - last_daily_report).seconds > 3600:
-                report = generate_daily_report()
-                from telegram_bot import send_performance_report
-                send_performance_report(report, "Daily")
-                last_daily_report = now
-                logger.info("Daily report sent.")
+            # 5. Daily report at 22:00 UTC
+            if now.hour == 22 and (now - last_daily_report).total_seconds() > 3600:
+                try:
+                    report = generate_daily_report()
+                    from telegram_bot import send_performance_report
+                    send_performance_report(report, "Daily")
+                    last_daily_report = now
+                    logger.info("Daily report sent.")
+                except Exception as exc:
+                    logger.error(f"Daily report failed: {exc}")
 
-            # 5. Weekly report Sunday 22:00 UTC
-            if now.weekday() == 6 and now.hour == 22 and (now - last_weekly_report).seconds > 3600:
-                report = generate_weekly_report()
-                from telegram_bot import send_performance_report
-                send_performance_report(report, "Weekly")
-                last_weekly_report = now
-                logger.info("Weekly report sent.")
+            # 6. Weekly report Sunday 22:00 UTC
+            if now.weekday() == 6 and now.hour == 22 and (now - last_weekly_report).total_seconds() > 3600:
+                try:
+                    report = generate_weekly_report()
+                    from telegram_bot import send_performance_report
+                    send_performance_report(report, "Weekly")
+                    last_weekly_report = now
+                    logger.info("Weekly report sent.")
+                except Exception as exc:
+                    logger.error(f"Weekly report failed: {exc}")
 
-            logger.info(f"Sleeping {SCAN_INTERVAL}s until next scan...")
-            time.sleep(SCAN_INTERVAL)
+            # 7. Sleep only remaining time to fill the cycle
+            # This ensures the next refresh starts exactly CYCLE_INTERVAL seconds
+            # after the previous one started — not after it ended
+            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+            sleep_time = max(0, CYCLE_INTERVAL - elapsed)
+            logger.info(f"Cycle took {elapsed:.1f}s. Sleeping {sleep_time:.1f}s until next scan...")
+            time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             logger.info("Bot stopped by user.")
@@ -166,7 +185,7 @@ def run_single_scan():
         print("Possible reasons:")
         print("  • Market is ranging or in a dead session")
         print("  • No confirmed S/R + pattern + indicator confluence")
-        print("  • AI confidence below 80%")
+        print("  • AI confidence below threshold")
         return
 
     print(f"\n✅ {len(signals)} signal(s) found:\n")
