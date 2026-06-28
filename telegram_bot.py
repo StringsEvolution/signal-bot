@@ -593,7 +593,7 @@ class BotCommandHandler:
                     _send_message(chat_id,
                         f"❌ <b>Connection Failed</b>\n\n"
                         f"Error: {result['error']}\n\n"
-                        f"Make sure your token has Read + Trade permissions."
+                        f"Make sure your token has Read Trade permissions."
                     )
             except Exception as exc:
                 _send_message(chat_id, f"❌ Error: {exc}")
