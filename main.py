@@ -79,12 +79,26 @@ def run_live_bot():
     cmd_handler = BotCommandHandler()
     cmd_handler.start()
 
-    # Seed history so indicators have enough candles the moment streaming starts
+    # Seed history so indicators have enough candles the moment streaming starts.
+    # Wrapped with a hard timeout: if the DB stalls (e.g. connection pool
+    # exhaustion, slow provider), the bot still starts streaming on schedule
+    # instead of hanging forever before it ever opens a single WebSocket.
+    # Any pairs that didn't get seeded in time get backfilled by the
+    # 5-minute backfill loop further down.
     logger.info("Seeding initial OHLC history...")
+    seed_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    seed_future = seed_pool.submit(refresh_all)
     try:
-        refresh_all()
+        seed_future.result(timeout=60)
+        logger.info("Initial seed complete.")
+    except concurrent.futures.TimeoutError:
+        logger.warning(
+            "Initial seed did not finish within 60s — starting live streams "
+            "anyway. Backfill loop will pick up any missing history."
+        )
     except Exception as exc:
-        logger.error(f"Initial seed refresh failed: {exc}")
+        logger.error(f"Initial seed refresh failed: {exc} — starting live streams anyway.")
+    seed_pool.shutdown(wait=False)
 
     worker_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=10, thread_name_prefix="signal-worker"
