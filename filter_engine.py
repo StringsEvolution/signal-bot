@@ -33,10 +33,25 @@ class NewsEvent:
 
 
 # ---------------------------------------------------------------------------
-# Session filter
+# Session filter — asset aware
 # ---------------------------------------------------------------------------
 
+# Default dead hours for most forex pairs (European/American assets)
 DEAD_HOURS_UTC = list(range(22, 24)) + list(range(0, 7))
+
+# Asset-specific dead hours
+# EURUSD — European asset, block full Asian dead zone
+# GBPUSD — European asset, block full Asian dead zone
+# XAUUSD — European/US commodity, block full Asian dead zone
+# USDJPY — Tokyo session active 00:00-09:00 UTC, only block quietest hours 03:00-06:00
+# BTCUSD — crypto trades 24/7, never block
+ASSET_DEAD_HOURS = {
+    "EURUSD": list(range(22, 24)) + list(range(0, 7)),   # original dead zone 22:00-07:00
+    "GBPUSD": list(range(22, 24)) + list(range(0, 7)),   # original dead zone 22:00-07:00
+    "XAUUSD": list(range(22, 24)) + list(range(0, 7)),   # original dead zone 22:00-07:00
+    "USDJPY": list(range(3, 6)),                          # only block 03:00-06:00, Tokyo active rest
+    "BTCUSD": [],                                         # crypto trades 24/7
+}
 
 TRADING_WINDOWS = {
     "london":   (7,  16),
@@ -45,21 +60,52 @@ TRADING_WINDOWS = {
 }
 
 
-def get_current_session(dt: Optional[datetime] = None) -> str:
+def get_current_session(dt: Optional[datetime] = None, asset: str = "") -> str:
     dt = dt or datetime.utcnow()
     h  = dt.hour
+
+    if asset == "USDJPY":
+        if 0 <= h < 9:
+            return "Tokyo"
+        if 7 <= h < 13:
+            return "London"
+        if 13 <= h < 16:
+            return "London/NY Overlap"
+        if 16 <= h < 22:
+            return "New York"
+        return "After Hours"
+
+    if asset == "BTCUSD":
+        if 13 <= h < 16:
+            return "London/NY Overlap (Peak)"
+        if 7 <= h < 16:
+            return "London"
+        if 16 <= h < 22:
+            return "New York"
+        return "Off-Peak (Crypto Active)"
+
+    # Default for EURUSD, GBPUSD, XAUUSD
     if 13 <= h < 16:
         return "London/NY Overlap"
     if 7 <= h < 13:
         return "London"
     if 16 <= h < 22:
         return "New York"
+    if 1 <= h < 7:
+        return "Early Asian (Low Liquidity)"
     return "Asian/Dead"
 
 
-def is_dead_session(dt: Optional[datetime] = None) -> bool:
+def is_dead_session(dt: Optional[datetime] = None, asset: str = "") -> bool:
     dt = dt or datetime.utcnow()
-    return dt.hour in DEAD_HOURS_UTC
+    h  = dt.hour
+
+    # Use asset-specific dead hours if available
+    if asset and asset in ASSET_DEAD_HOURS:
+        return h in ASSET_DEAD_HOURS[asset]
+
+    # Default dead hours for unknown assets
+    return h in DEAD_HOURS_UTC
 
 
 def is_weekend(dt: Optional[datetime] = None) -> bool:
@@ -71,21 +117,18 @@ def is_weekend(dt: Optional[datetime] = None) -> bool:
 # Volatility thresholds — timeframe-aware
 # ---------------------------------------------------------------------------
 
-# Shorter timeframes have smaller candles so ATR% is naturally lower.
-# Each value is the MINIMUM ATR% required to pass the volatility filter.
 ATR_THRESHOLD = {
-    "M1":  0.015,   # was 0.03 for all — M1 candles are tiny, lower threshold
-    "M2":  0.012,   # M2/M3 even smaller candles, needs lower threshold
+    "M1":  0.015,
+    "M2":  0.012,
     "M3":  0.012,
-    "M5":  0.03,    # original threshold — unchanged
-    "M15": 0.03,    # original threshold — unchanged
+    "M5":  0.03,
+    "M15": 0.03,
 }
 
-DEFAULT_ATR_THRESHOLD = 0.03   # fallback for any unrecognised timeframe
+DEFAULT_ATR_THRESHOLD = 0.03
 
 
 def is_low_volatility(atr_pct: float, timeframe: str = "M5") -> bool:
-    """ATR below timeframe-specific threshold = dead market."""
     threshold = ATR_THRESHOLD.get(timeframe, DEFAULT_ATR_THRESHOLD)
     return atr_pct < threshold
 
@@ -200,6 +243,8 @@ def is_high_spread(asset: str, spread_pct: float) -> bool:
         "EURUSD": 0.01,
         "GBPUSD": 0.015,
         "XAUUSD": 0.05,
+        "USDJPY": 0.01,
+        "BTCUSD": 0.50,
     }
     return spread_pct > MAX_SPREAD.get(asset, 0.02)
 
@@ -226,10 +271,13 @@ def apply_filters(
         result.reasons.append("Weekend — markets closed")
         return result
 
-    # 2. Dead session
-    if is_dead_session(dt):
+    # 2. Dead session — asset aware
+    if is_dead_session(dt, asset):
         result.allowed = False
-        result.reasons.append(f"Dead session hour ({dt.hour}:00 UTC) — Asian dead zone")
+        result.reasons.append(
+            f"Dead session hour ({dt.hour}:00 UTC) — "
+            f"{'Asian dead zone' if not asset else f'{asset} inactive at this hour'}"
+        )
         return result
 
     # 3. News risk
@@ -239,7 +287,7 @@ def apply_filters(
         result.reasons.append(f"High-impact news risk: {news_title} (±30 min window)")
         return result
 
-    # 4. Low volatility — now timeframe-aware
+    # 4. Low volatility — timeframe aware
     if is_low_volatility(atr_pct, timeframe):
         threshold = ATR_THRESHOLD.get(timeframe, DEFAULT_ATR_THRESHOLD)
         result.allowed = False
@@ -261,11 +309,17 @@ def apply_filters(
         return result
 
     # 7. Warnings (non-blocking)
-    session = get_current_session(dt)
-    if session == "London/NY Overlap":
-        result.warnings.append("London/NY Overlap — highest liquidity ✓")
+    session = get_current_session(dt, asset)
+    if "Overlap" in session:
+        result.warnings.append(f"{session} — highest liquidity ✓")
     elif session == "New York" and dt.hour > 19:
         result.warnings.append("Late NY session — liquidity decreasing")
+    elif session in ("Early Asian (Low Liquidity)", "After Hours"):
+        result.warnings.append(f"{session} — lower volume, trade carefully")
+    elif session == "Tokyo":
+        result.warnings.append("Tokyo session — best for USDJPY signals")
+    elif session == "Off-Peak (Crypto Active)":
+        result.warnings.append("Off-peak hours — crypto still active but lower volume")
 
     if volatility_state == "high":
         result.warnings.append("High volatility — widen mental stop, reduce size")
