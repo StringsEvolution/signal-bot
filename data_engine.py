@@ -408,11 +408,10 @@ def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
                 volume=EXCLUDED.volume
     """)
 
-    with _db_lock:
-        engine = get_engine()
-        with engine.connect() as conn:
-            conn.execute(upsert, rows)
-            conn.commit()
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(upsert, rows)
+        conn.commit()
 
     logger.debug(f"Stored {len(df)} rows for {asset}/{timeframe}.")
 
@@ -431,11 +430,10 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
         LIMIT :lim
     """)
 
-    with _db_lock:
-        engine = get_engine()
-        with engine.connect() as conn:
-            result = conn.execute(sql, {"asset": asset, "tf": timeframe, "lim": limit})
-            rows   = result.fetchall()
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(sql, {"asset": asset, "tf": timeframe, "lim": limit})
+        rows   = result.fetchall()
 
     if not rows:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
