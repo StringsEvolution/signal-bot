@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -138,10 +138,24 @@ def get_engine():
             pool_timeout=10,      # max wait for a free connection from the pool
             pool_recycle=300,     # avoid stale connections to managed Postgres
             connect_args={
-                "connect_timeout": 10,        # TCP/handshake timeout
-                "options": "-c statement_timeout=15000",  # 15s per query
+                "connect_timeout": 10,        # TCP/handshake timeout only
             },
         )
+
+        # Neon's pooled endpoint (pgbouncer) rejects startup-time options
+        # like "-c statement_timeout=..." with "unsupported startup
+        # parameter" — pgbouncer doesn't forward arbitrary startup params.
+        # Setting it AFTER the connection is established works fine on both
+        # pooled and direct connections, so we do it via an event hook
+        # instead of connect_args.
+        @event.listens_for(_engine, "connect")
+        def _set_session_timeout(dbapi_conn, conn_record):
+            cursor = dbapi_conn.cursor()
+            try:
+                cursor.execute("SET statement_timeout = 15000")  # 15s per query
+            finally:
+                cursor.close()
+
         return _engine
 
 
