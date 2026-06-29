@@ -235,6 +235,112 @@ async def _fetch_all_deriv_async(pairs: list, n_candles: int = 200) -> dict:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Real-time streaming engine — push-based, replaces polling for live signals
+#
+# Instead of fetching all pairs on a fixed timer (which caps freshness at the
+# poll interval), this opens ONE persistent Deriv WebSocket per asset and
+# SUBSCRIBES to live OHLC updates for every timeframe on that asset at once.
+# Deriv pushes a price update on every tick. We detect a candle close the
+# instant the server starts a new candle (open_time changes) and fire
+# `on_close` immediately with the just-finished candle — typically within
+# 1-3 seconds of the real close, for every timeframe, all the time.
+# ---------------------------------------------------------------------------
+
+async def _stream_asset(asset: str, timeframes: list, on_close, stop_event: asyncio.Event):
+    """
+    Maintain a persistent subscription connection for one asset across all
+    its timeframes. Reconnects automatically on drop.
+    """
+    symbol  = DERIV_SYMBOLS.get(asset)
+    if not symbol:
+        return
+    req_map = {i + 1: tf for i, tf in enumerate(timeframes)}
+
+    while not stop_event.is_set():
+        last_candle = {}
+        try:
+            async with websockets.connect(
+                DERIV_WS_URL, open_timeout=15, ping_interval=20, ping_timeout=20
+            ) as ws:
+                for req_id, tf in req_map.items():
+                    await ws.send(json.dumps({
+                        "ticks_history":     symbol,
+                        "style":             "candles",
+                        "granularity":       DERIV_GRANULARITY[tf],
+                        "subscribe":         1,
+                        "count":             1,
+                        "end":               "latest",
+                        "req_id":            req_id,
+                    }))
+                logger.info(f"📡 Live stream connected: {asset} ({len(req_map)} timeframes)")
+
+                while not stop_event.is_set():
+                    raw = await asyncio.wait_for(ws.recv(), timeout=40)
+                    msg = json.loads(raw)
+
+                    if msg.get("error"):
+                        logger.warning(f"Stream error {asset}: {msg['error'].get('message')}")
+                        continue
+
+                    tf = req_map.get(msg.get("req_id"))
+                    if not tf:
+                        continue
+
+                    mtype = msg.get("msg_type")
+
+                    if mtype == "candles":
+                        candles = msg.get("candles") or []
+                        if candles:
+                            c = candles[-1]
+                            last_candle[tf] = {
+                                "open_time": int(c["epoch"]),
+                                "open":  float(c["open"]),
+                                "high":  float(c["high"]),
+                                "low":   float(c["low"]),
+                                "close": float(c["close"]),
+                            }
+
+                    elif mtype == "ohlc":
+                        c = msg["ohlc"]
+                        snapshot = {
+                            "open_time": int(c["open_time"]),
+                            "open":  float(c["open"]),
+                            "high":  float(c["high"]),
+                            "low":   float(c["low"]),
+                            "close": float(c["close"]),
+                        }
+                        prev = last_candle.get(tf)
+                        if prev is not None and prev["open_time"] != snapshot["open_time"]:
+                            # Server rolled over to a new candle the instant this
+                            # message arrived → `prev` is the candle that JUST closed.
+                            closed = prev
+                            asyncio.create_task(on_close(asset, tf, closed))
+                        last_candle[tf] = snapshot
+
+        except asyncio.TimeoutError:
+            logger.warning(f"{asset} stream silent for 40s — reconnecting.")
+        except Exception as exc:
+            logger.warning(f"{asset} stream dropped ({exc}) — reconnecting in 3s.")
+            await asyncio.sleep(3)
+
+
+async def run_streaming_engine(on_close, stop_event: Optional[asyncio.Event] = None):
+    """
+    Runs all per-asset streams concurrently for the lifetime of the bot.
+    `on_close(asset, timeframe, candle_dict)` is called the instant a candle
+    closes on ANY timeframe for ANY asset — for every asset/timeframe
+    combination independently, so each timeframe reacts at its own natural
+    pace (M1 fires every ~60s, M2 every ~120s, etc.) with only a couple of
+    seconds of detection + processing latency layered on top.
+    """
+    stop_event = stop_event or asyncio.Event()
+    await asyncio.gather(*[
+        _stream_asset(asset, TIMEFRAMES, on_close, stop_event)
+        for asset in ASSETS
+    ])
+
+
 async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
     """Single pair fetch — used only as fallback."""
     result = await _fetch_all_deriv_async([(asset, timeframe)], n_candles)
