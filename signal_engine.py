@@ -125,6 +125,36 @@ def _mark_emitted(asset: str, timeframe: str, direction: str, dt: datetime):
 
 
 # ---------------------------------------------------------------------------
+# Candle timestamp helper
+# ---------------------------------------------------------------------------
+
+def _get_signal_timestamp(df: pd.DataFrame, scan_dt: datetime) -> datetime:
+    """
+    Use the last candle's actual close time as the signal timestamp.
+    Falls back to scan_dt if candle timestamp is missing or too stale.
+    """
+    try:
+        raw_ts = df["timestamp"].iloc[-1]
+        candle_ts = pd.Timestamp(raw_ts)
+
+        # Strip timezone if present
+        if candle_ts.tzinfo is not None:
+            candle_ts = candle_ts.tz_localize(None)
+
+        candle_dt = candle_ts.to_pydatetime()
+
+        # Only use if candle is recent (within last 5 minutes)
+        age_seconds = (scan_dt.replace(tzinfo=None) - candle_dt).total_seconds()
+        if 0 <= age_seconds <= 300:
+            return candle_dt
+
+    except Exception:
+        pass
+
+    return scan_dt
+
+
+# ---------------------------------------------------------------------------
 # Core signal generation
 # ---------------------------------------------------------------------------
 
@@ -154,7 +184,7 @@ def generate_signal(
         logger.warning(f"⛔ {tag}: data load failed — {exc}")
         return None
 
-    # Skip if not enough data — prevents segfault on market open
+    # Skip if not enough data
     if df is None or len(df) < 50:
         logger.info(f"⏭️ {tag}: skipping — only {len(df) if df is not None else 0} candles (market just opened)")
         return None
@@ -265,8 +295,8 @@ def generate_signal(
 
     # Direction consistency check
     if ai_score.direction != direction:
-        matching_prob  = ai_score.prob_up if direction == "CALL" else ai_score.prob_down
-        min_prob       = 0.55 if timeframe in ("M1", "M2", "M3") else 0.60
+        matching_prob = ai_score.prob_up if direction == "CALL" else ai_score.prob_down
+        min_prob      = 0.55 if timeframe in ("M1", "M2", "M3") else 0.60
         logger.info(
             f"⚠️  {tag}: AI direction conflict "
             f"(AI={ai_score.direction} struct={direction}) "
@@ -283,13 +313,17 @@ def generate_signal(
         )
         return None
 
-    # ---- All gates passed — emit signal ----
-    reasons = _build_reasons(direction, struct, ind, pa, ai_score, dt)
+    # ---- All gates passed ----
+
+    # Get signal timestamp from candle close time
+    signal_ts = _get_signal_timestamp(df, dt)
+
+    reasons = _build_reasons(direction, struct, ind, pa, ai_score, signal_ts)
     expiry  = TF_EXPIRY[timeframe]
-    session = get_current_session(dt)
+    session = get_current_session(signal_ts)
 
     signal = Signal(
-        timestamp=dt,
+        timestamp=signal_ts,
         asset=asset,
         timeframe=timeframe,
         direction=direction,
@@ -309,7 +343,8 @@ def generate_signal(
 
     logger.info(
         f"✅ SIGNAL EMITTED: {asset}/{timeframe} {direction} "
-        f"conf={ai_score.confidence:.1f}% entry={entry_price:.5f}"
+        f"conf={ai_score.confidence:.1f}% entry={entry_price:.5f} "
+        f"candle_time={signal_ts.strftime('%H:%M:%S')}"
     )
     return signal
 
@@ -402,7 +437,7 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
 
     # 1. Trend
     trend_label = "Uptrend" if struct.trend == "bullish" else "Downtrend" if struct.trend == "bearish" else "Ranging market"
-    ema_symbol = "&gt;" if struct.trend == "bullish" else "&lt;"
+    ema_symbol  = "&gt;" if struct.trend == "bullish" else "&lt;"
     reasons.append(
         f"{trend_label} confirmed "
         f"(EMA 50 {ema_symbol} EMA 200, strength={struct.trend_strength:.0%})"
@@ -432,7 +467,7 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
     if struct.breakout:
         reasons.append(f"Structural breakout: {struct.breakout.replace('_', ' ').title()}")
 
-    # 5. Price action pattern
+    # 5. Price action
     if pa.dominant_pattern:
         reasons.append(f"{pa.dominant_pattern.name} — {pa.dominant_pattern.description}")
     if is_call and pa.bullish_bias > 0.5:
@@ -458,23 +493,17 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
     elif ind.macd_cross == "bearish":
         reasons.append(f"MACD bearish crossover confirmed — {'momentum aligns with PUT' if is_put else 'crossover conflict, structure dominant'}")
     elif ind.macd_hist > 0:
-        if is_call:
-            reasons.append("MACD histogram positive — bullish momentum building")
-        else:
-            reasons.append("MACD histogram positive but weakening — bearish structure override")
+        reasons.append("MACD histogram positive — bullish momentum building" if is_call else "MACD histogram positive but weakening — bearish structure override")
     elif ind.macd_hist < 0:
-        if is_put:
-            reasons.append("MACD histogram negative — bearish momentum building")
-        else:
-            reasons.append("MACD histogram negative but reversing — bullish structure override")
+        reasons.append("MACD histogram negative — bearish momentum building" if is_put else "MACD histogram negative but reversing — bullish structure override")
 
-    # 8. EMA trend context
+    # 8. EMA
     if ind.ema_trend == "bullish" and is_call:
         reasons.append(f"EMA trend bullish (spread={ind.ema_spread_pct:.2f}%) — trade with trend")
     elif ind.ema_trend == "bearish" and is_put:
         reasons.append(f"EMA trend bearish (spread={ind.ema_spread_pct:.2f}%) — trade with trend")
     elif ind.ema_trend == "neutral":
-        reasons.append(f"EMA trend neutral — signal driven by price action and structure")
+        reasons.append("EMA trend neutral — signal driven by price action and structure")
 
     # 9. AI score
     reasons.append(
