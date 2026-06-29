@@ -165,65 +165,83 @@ def init_db():
 # Deriv API — Primary real-time data source
 # ---------------------------------------------------------------------------
 
-async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
-    symbol      = DERIV_SYMBOLS.get(asset)
-    granularity = DERIV_GRANULARITY.get(timeframe)
+async def _fetch_all_deriv_async(pairs: list, n_candles: int = 200) -> dict:
+    """
+    ONE WebSocket connection fetches ALL pairs sequentially.
+    Avoids 25 simultaneous connections which causes Deriv throttling/delays.
+    Returns dict: {(asset, tf): DataFrame}
+    """
+    token   = os.getenv("DERIV_API_TOKEN", "").strip()
+    results = {}
 
-    if not symbol or not granularity:
-        raise ValueError(f"Unsupported asset/timeframe: {asset}/{timeframe}")
+    async with websockets.connect(DERIV_WS_URL, open_timeout=15, ping_interval=20) as ws:
 
-    token = os.getenv("DERIV_API_TOKEN", "").strip()
-
-    async with websockets.connect(DERIV_WS_URL, ping_interval=20) as ws:
-
+        # Authenticate once if token available
         if token:
             await ws.send(json.dumps({"authorize": token}))
             auth_resp = json.loads(await ws.recv())
             if auth_resp.get("error"):
-                logger.debug(
-                    f"Deriv auth skipped ({auth_resp['error']['message']}) "
-                    f"— fetching unauthenticated."
-                )
+                logger.debug(f"Deriv auth skipped — fetching unauthenticated.")
 
-        request = {
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": n_candles,
-            "end": "latest",
-            "granularity": granularity,
-            "style": "candles",
-        }
-        await ws.send(json.dumps(request))
-        response = json.loads(await ws.recv())
+        # Fetch each pair over the same connection
+        for asset, timeframe in pairs:
+            symbol      = DERIV_SYMBOLS.get(asset)
+            granularity = DERIV_GRANULARITY.get(timeframe)
+            if not symbol or not granularity:
+                continue
+            try:
+                request = {
+                    "ticks_history":    symbol,
+                    "adjust_start_time": 1,
+                    "count":            n_candles,
+                    "end":              "latest",
+                    "granularity":      granularity,
+                    "style":            "candles",
+                }
+                await ws.send(json.dumps(request))
+                response = json.loads(await ws.recv())
 
-        if response.get("error"):
-            raise ValueError(f"Deriv error: {response['error']['message']}")
+                if response.get("error"):
+                    logger.warning(f"Deriv error {asset}/{timeframe}: {response['error']['message']}")
+                    continue
 
-        candles = response.get("candles", [])
-        if not candles:
-            raise ValueError(f"No candles returned from Deriv for {asset}/{timeframe}")
+                candles = response.get("candles", [])
+                if not candles:
+                    logger.warning(f"No candles from Deriv for {asset}/{timeframe}")
+                    continue
 
-        rows = []
-        for c in candles:
-            rows.append({
-                "timestamp": pd.to_datetime(c["epoch"], unit="s"),
-                "open":      float(c["open"]),
-                "high":      float(c["high"]),
-                "low":       float(c["low"]),
-                "close":     float(c["close"]),
-                "volume":    0.0,
-            })
+                rows = [
+                    {
+                        "timestamp": pd.to_datetime(c["epoch"], unit="s"),
+                        "open":  float(c["open"]),
+                        "high":  float(c["high"]),
+                        "low":   float(c["low"]),
+                        "close": float(c["close"]),
+                        "volume": 0.0,
+                    }
+                    for c in candles
+                ]
+                df = pd.DataFrame(rows)
+                df = _clean_dtypes(df)
+                df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+                df = df.drop_duplicates(subset=["timestamp"])
+                df = _sort_by_timestamp_safe(df)
+                results[(asset, timeframe)] = df
+                logger.info(f"✅ Deriv: {asset}/{timeframe} — {len(df)} candles")
 
-        df = pd.DataFrame(rows)
-        df = _clean_dtypes(df)
-        df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
-        df = df.drop_duplicates(subset=["timestamp"])
-        # Deriv returns candles already in chronological order; sort the
-        # underlying numpy values and rebuild to avoid pandas iloc reindex.
-        df = _sort_by_timestamp_safe(df)
+            except Exception as exc:
+                logger.warning(f"Deriv fetch error {asset}/{timeframe}: {exc}")
 
-        logger.info(f"✅ Deriv: fetched {len(df)} candles for {asset}/{timeframe} (real-time)")
-        return df
+    return results
+
+
+async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
+    """Single pair fetch — used only as fallback."""
+    result = await _fetch_all_deriv_async([(asset, timeframe)], n_candles)
+    df = result.get((asset, timeframe))
+    if df is None or df.empty:
+        raise ValueError(f"No data from Deriv for {asset}/{timeframe}")
+    return df
 
 
 def _fetch_deriv(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
@@ -541,26 +559,61 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
 
 
 def refresh_all():
-    """Fetch all assets/timeframes in parallel."""
-    import concurrent.futures
-
+    """
+    Fetch all assets/timeframes in ONE Deriv WebSocket connection.
+    Falls back per-pair to Twelve Data for any that fail.
+    """
     pairs      = [(asset, tf) for asset in ASSETS for tf in TIMEFRAMES]
     start_time = time.time()
 
-    def fetch_and_store(asset: str, tf: str):
-        try:
-            df = fetch_ohlc(asset, tf)
-            store_ohlc(asset, tf, df)
-            logger.info(f"✅ Refreshed {asset}/{tf}")
-        except Exception as exc:
-            logger.error(f"refresh_all failed for {asset}/{tf}: {exc}")
+    # --- Step 1: batch fetch ALL pairs over a single Deriv WS connection ---
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        deriv_results = loop.run_until_complete(_fetch_all_deriv_async(pairs))
+        loop.close()
+    except Exception as exc:
+        logger.warning(f"Deriv batch fetch failed: {exc} — falling back to Twelve Data")
+        deriv_results = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
-        futures = [executor.submit(fetch_and_store, asset, tf) for asset, tf in pairs]
-        concurrent.futures.wait(futures)
+    # --- Step 2: store Deriv results, fallback to Twelve Data for misses ---
+    import concurrent.futures
+
+    def finish_pair(asset: str, tf: str):
+        df = deriv_results.get((asset, tf))
+        if df is not None and not df.empty:
+            store_ohlc(asset, tf, df)
+            return
+        # Deriv missed this pair — try Twelve Data
+        km = get_key_manager()
+        if km.has_keys:
+            try:
+                df = _fetch_twelve_data(asset, tf)
+                store_ohlc(asset, tf, df)
+                logger.info(f"✅ Twelve Data fallback: {asset}/{tf}")
+                return
+            except Exception as exc:
+                logger.warning(f"Twelve Data also failed {asset}/{tf}: {exc}")
+        # Last resort: synthetic
+        try:
+            df = _synthetic_ohlc(asset, tf)
+            store_ohlc(asset, tf, df)
+            logger.warning(f"⚠️ Using synthetic data for {asset}/{tf}")
+        except Exception as exc:
+            logger.error(f"All sources failed for {asset}/{tf}: {exc}")
+
+    # Twelve Data fallbacks can run in parallel (they use HTTP, not WS)
+    missed = [p for p in pairs if p not in deriv_results]
+    if missed:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(finish_pair, a, tf) for a, tf in pairs]
+            concurrent.futures.wait(futures)
+    else:
+        for asset, tf in pairs:
+            finish_pair(asset, tf)
 
     elapsed = time.time() - start_time
-    logger.info(f"⚡ All {len(pairs)} pairs refreshed in {elapsed:.1f}s (parallel)")
+    logger.info(f"⚡ All {len(pairs)} pairs refreshed in {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
