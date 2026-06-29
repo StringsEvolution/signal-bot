@@ -118,11 +118,21 @@ def _edit_message(chat_id: str, message_id: int, text: str, parse_mode: str = "H
 # Signal formatters
 # ---------------------------------------------------------------------------
 
-def _format_free_message(signal) -> str:
-    is_call = signal.direction == "CALL"
-    icon    = "🟢" if is_call else "🔴"
-    label   = "CALL ↑ BUY" if is_call else "PUT ↓ SELL"
-    action  = "Price expected to RISE" if is_call else "Price expected to FALL"
+def _format_free_message(signal, sent_at: datetime = None) -> str:
+    is_call  = signal.direction == "CALL"
+    icon     = "🟢" if is_call else "🔴"
+    label    = "CALL ↑ BUY" if is_call else "PUT ↓ SELL"
+    action   = "Price expected to RISE" if is_call else "Price expected to FALL"
+    sent_at  = sent_at or datetime.now(timezone.utc)
+
+    # Show sent time (when you actually receive it) + candle time (what triggered it)
+    sent_wat   = _to_wat(sent_at).strftime('%H:%M WAT')
+    candle_wat = _to_wat(signal.timestamp).strftime('%H:%M WAT')
+    time_line  = (
+        f"🕒 Sent: <b>{sent_wat}</b>  |  📊 Candle: {candle_wat}"
+        if sent_wat != candle_wat
+        else f"🕒 Time: <b>{sent_wat}</b>"
+    )
 
     return (
         f"🔔 <b>New Signal</b>\n\n"
@@ -130,19 +140,20 @@ def _format_free_message(signal) -> str:
         f"📈 {action}\n"
         f"⏳ Expiry: {signal.expiry_min} min\n"
         f"🤖 Confidence: <b>{signal.confidence:.0f}%</b>\n"
-        f"🕒 Time: {_to_wat(signal.timestamp).strftime('%H:%M WAT')}\n\n"
+        f"{time_line}\n\n"
         f"📊 Full analysis available in VIP 👇\n"
         f"🔒 Join: {os.getenv('VIP_INVITE_LINK', 't.me/your_vip_link')}"
     )
 
 
-def _format_vip_message(signal) -> str:
+def _format_vip_message(signal, sent_at: datetime = None) -> str:
     is_call  = signal.direction == "CALL"
     icon     = "🟢" if is_call else "🔴"
     label    = "CALL ↑ BUY" if is_call else "PUT ↓ SELL"
     action   = "📈 Price expected to RISE — place a CALL/BUY trade" if is_call \
                else "📉 Price expected to FALL — place a PUT/SELL trade"
     r_icon   = "✅" if is_call else "🔻"
+    sent_at  = sent_at or datetime.now(timezone.utc)
 
     if signal.reasons:
         reasons_html = "\n".join(f"  {r_icon} {r}" for r in signal.reasons)
@@ -153,6 +164,13 @@ def _format_vip_message(signal) -> str:
     if signal.warnings:
         warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
 
+    # sent_at = actual delivery time (what trader should act on)
+    # signal.timestamp = candle close that triggered the signal
+    sent_str   = _to_wat(sent_at).strftime('%Y-%m-%d %H:%M:%S')
+    candle_str = _to_wat(signal.timestamp).strftime('%H:%M:%S')
+    lag_sec    = int((sent_at.replace(tzinfo=timezone.utc) - signal.timestamp.replace(tzinfo=timezone.utc)).total_seconds())
+    lag_note   = f" (+{lag_sec}s delivery)" if lag_sec > 2 else ""
+
     return (
         f"{'⭐' if is_call else '🔥'} <b>VIP Signal</b> — {icon} {label}\n\n"
         f"{action}\n\n"
@@ -162,7 +180,8 @@ def _format_vip_message(signal) -> str:
         f"💰 <b>Entry:</b>      <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>    {signal.session}\n"
-        f"🕒 <b>WAT Time:</b>   {_to_wat(signal.timestamp).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"🕒 <b>Sent (WAT):</b> <b>{sent_str}</b>{lag_note}\n"
+        f"📊 <b>Candle time:</b> {candle_str} WAT\n\n"
         f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
         f"⚠️ <i>Risk disclaimer: Binary options carry significant financial risk. "
         f"Never trade with money you cannot afford to lose. Past performance does not guarantee future results.</i>"
@@ -214,13 +233,14 @@ def _trade_keyboard(signal_key: str, amount: float, direction: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def send_signal(signal) -> dict:
-    results = {}
+    results  = {}
+    sent_at  = datetime.now(timezone.utc)   # capture ACTUAL send time here
 
     if FREE_CHANNEL:
-        results["free"] = _send_message(FREE_CHANNEL, _format_free_message(signal))
+        results["free"] = _send_message(FREE_CHANNEL, _format_free_message(signal, sent_at))
 
     if VIP_CHANNEL:
-        results["vip"] = _send_message(VIP_CHANNEL, _format_vip_message(signal))
+        results["vip"] = _send_message(VIP_CHANNEL, _format_vip_message(signal, sent_at))
 
     if ADMIN_CHAT_ID:
         _send_trade_prompt(ADMIN_CHAT_ID, signal)
