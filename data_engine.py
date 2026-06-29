@@ -29,7 +29,6 @@ TIMEFRAMES = ["M1", "M2", "M3", "M5", "M15"]
 TF_MINUTES = {"M1": 1,  "M2": 2,  "M3": 3,  "M5": 5,  "M15": 15}
 TF_EXPIRY  = {"M1": 1,  "M2": 2,  "M3": 3,  "M5": 5,  "M15": 15}
 
-# Deriv symbol mapping
 DERIV_SYMBOLS = {
     "EURUSD": "frxEURUSD",
     "GBPUSD": "frxGBPUSD",
@@ -38,12 +37,10 @@ DERIV_SYMBOLS = {
     "BTCUSD": "cryBTCUSD",
 }
 
-# Deriv granularity in seconds
 DERIV_GRANULARITY = {"M1": 60, "M2": 120, "M3": 180, "M5": 300, "M15": 900}
 
-DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=36544"
 
-# Thread lock — prevents race condition between parallel fetch (write) and scan (read)
 _db_lock = threading.Lock()
 
 
@@ -60,7 +57,6 @@ def get_engine():
 
 
 def init_db():
-    """Create tables if they do not exist."""
     engine = get_engine()
     ddl = """
     CREATE TABLE IF NOT EXISTS ohlc_data (
@@ -117,7 +113,6 @@ def init_db():
 # ---------------------------------------------------------------------------
 
 async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
-    """Fetch OHLC candles from Deriv WebSocket API."""
     symbol      = DERIV_SYMBOLS.get(asset)
     granularity = DERIV_GRANULARITY.get(timeframe)
 
@@ -128,19 +123,15 @@ async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -
 
     async with websockets.connect(DERIV_WS_URL, ping_interval=20) as ws:
 
-        # Authenticate only if token is set and looks valid (non-empty)
         if token:
             await ws.send(json.dumps({"authorize": token}))
             auth_resp = json.loads(await ws.recv())
             if auth_resp.get("error"):
-                # Log once at DEBUG level — not a critical error, data still flows
                 logger.debug(
                     f"Deriv auth skipped ({auth_resp['error']['message']}) "
                     f"— fetching unauthenticated."
                 )
-                # Don't return — unauthenticated data fetch still works
 
-        # Request candles
         request = {
             "ticks_history": symbol,
             "adjust_start_time": 1,
@@ -170,13 +161,17 @@ async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -
                 "volume":    0.0,
             })
 
-        df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+        df = pd.DataFrame(rows)
+        # Safe sort — handles duplicates and NaN timestamps
+        df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+        df = df.drop_duplicates(subset=["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
         logger.info(f"✅ Deriv: fetched {len(df)} candles for {asset}/{timeframe} (real-time)")
         return df
 
 
 def _fetch_deriv(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
-    """Sync wrapper for Deriv async fetch."""
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -305,7 +300,10 @@ def _fetch_twelve_data(asset: str, timeframe: str) -> pd.DataFrame:
                     "volume": float(v.get("volume", 0)),
                 })
 
-            df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+            df = pd.DataFrame(rows)
+            df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+            df = df.drop_duplicates(subset=["timestamp"])
+            df = df.sort_values("timestamp").reset_index(drop=True)
             logger.info(f"⚠️ Twelve Data fallback: {len(df)} candles for {asset}/{timeframe}")
             return df
 
@@ -359,12 +357,6 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
 # ---------------------------------------------------------------------------
 
 def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
-    """
-    Fetch priority:
-    1. Deriv API   — real-time, unlimited, Nigeria supported
-    2. Twelve Data — fallback if Deriv fails
-    3. Synthetic   — last resort (not for production)
-    """
     # 1. Try Deriv
     try:
         df = _fetch_deriv(asset, timeframe, n_candles)
@@ -390,10 +382,6 @@ def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame
 # ---------------------------------------------------------------------------
 
 def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
-    """
-    Bulk upsert — all rows in one round-trip.
-    Thread-safe via _db_lock.
-    """
     if df.empty:
         return
 
@@ -432,7 +420,8 @@ def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
 def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     """
     Load most recent candles from PostgreSQL.
-    Thread-safe via _db_lock — prevents race condition with parallel writes.
+    Thread-safe via _db_lock.
+    Includes safety guards against NaN/duplicate timestamps that cause segfault.
     """
     sql = text("""
         SELECT timestamp, open, high, low, close, volume
@@ -451,7 +440,6 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    # Build DataFrame outside the lock — pure pandas, no DB access
     records = [
         {
             "timestamp": row[0],
@@ -465,13 +453,22 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     ]
 
     df = pd.DataFrame(records)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    # Safety guards — prevent segfault from bad data
+    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    df = df.drop_duplicates(subset=["timestamp"])
+
+    if len(df) < 5:
+        logger.warning(f"Insufficient data for {asset}/{timeframe}: only {len(df)} rows")
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
 
 def refresh_all():
-    """Fetch all assets/timeframes in parallel — ~20s instead of ~3 mins."""
+    """Fetch all assets/timeframes in parallel."""
     import concurrent.futures
 
     pairs      = [(asset, tf) for asset in ASSETS for tf in TIMEFRAMES]
