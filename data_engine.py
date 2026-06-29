@@ -453,9 +453,21 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     ]
 
     df = pd.DataFrame(records)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-    # Safety guards — prevent segfault from bad data
+    # Convert timestamps — strip timezone info to avoid Python 3.13 + pandas segfault
+    # on sort_values with timezone-aware TIMESTAMPTZ from PostgreSQL
+    def _safe_ts(ts):
+        try:
+            t = pd.to_datetime(ts, errors="coerce", utc=True)
+            if pd.isna(t):
+                return pd.NaT
+            return t.tz_localize(None) if t.tzinfo is None else t.tz_convert(None)
+        except Exception:
+            return pd.NaT
+
+    df["timestamp"] = df["timestamp"].apply(_safe_ts)
+
+    # Safety guards
     df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
     df = df.drop_duplicates(subset=["timestamp"])
 
@@ -463,7 +475,9 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
         logger.warning(f"Insufficient data for {asset}/{timeframe}: only {len(df)} rows")
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    # Use numpy argsort instead of pandas sort_values to avoid segfault
+    idx = df["timestamp"].values.argsort()
+    df  = df.iloc[idx].reset_index(drop=True)
     return df
 
 
