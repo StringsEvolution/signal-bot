@@ -736,7 +736,7 @@ def refresh_all():
 
     missed = [p for p in pairs if p not in deriv_results]
     if missed:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
             futures = [executor.submit(finish_pair, a, tf) for a, tf in pairs]
             concurrent.futures.wait(futures)
     else:
