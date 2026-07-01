@@ -128,34 +128,34 @@ def _mark_emitted(asset: str, timeframe: str, direction: str, dt: datetime):
 # Candle timestamp helper
 # ---------------------------------------------------------------------------
 
-def _get_signal_timestamp(df: pd.DataFrame, scan_dt: datetime) -> datetime:
+# Hard ceiling on how old the last closed candle is allowed to be when a
+# signal is emitted. Past this, the underlying data is too stale to trust —
+# the signal gets REJECTED, never relabeled as "now".
+MAX_CANDLE_AGE_SECONDS = 20
+
+
+def _get_candle_age(df: pd.DataFrame, scan_dt: datetime):
     """
-    Use the last candle's actual close time as the signal timestamp.
-    Falls back to scan_dt if candle timestamp is missing or too stale.
+    Returns (candle_dt, age_seconds) using the last candle's REAL close
+    timestamp. Never substitutes scan_dt for the candle time — callers must
+    decide what to do with a stale/missing candle, never display a fake
+    "fresh" timestamp on data that's actually old.
+
+    Returns (None, None) if the timestamp can't be parsed.
     """
     try:
         raw_ts = df["timestamp"].iloc[-1]
         candle_ts = pd.Timestamp(raw_ts)
 
-        # Strip timezone if present
         if candle_ts.tzinfo is not None:
             candle_ts = candle_ts.tz_localize(None)
 
         candle_dt = candle_ts.to_pydatetime()
-
-        # Only use if candle is genuinely fresh. With the streaming engine,
-        # generate_signal() is called within ~1-3s of the real candle close,
-        # so anything older than ~20s means something upstream stalled —
-        # better to fall back to scan_dt (or be rejected by the caller)
-        # than silently ship a signal that's minutes late.
         age_seconds = (scan_dt.replace(tzinfo=None) - candle_dt).total_seconds()
-        if 0 <= age_seconds <= 20:
-            return candle_dt
+        return candle_dt, age_seconds
 
     except Exception:
-        pass
-
-    return scan_dt
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +191,21 @@ def generate_signal(
     # Skip if not enough data
     if df is None or len(df) < 50:
         logger.info(f"⏭️ {tag}: skipping — only {len(df) if df is not None else 0} candles (market just opened)")
+        return None
+
+    # --- Freshness gate — checked BEFORE running the (slower) indicator /
+    # structure / AI pipeline, so we don't waste time analysing data we're
+    # about to throw away anyway.
+    candle_dt, age_seconds = _get_candle_age(df, dt)
+    if candle_dt is None:
+        logger.warning(f"⛔ {tag}: could not parse candle timestamp — rejecting")
+        return None
+    if age_seconds is None or age_seconds < 0 or age_seconds > MAX_CANDLE_AGE_SECONDS:
+        logger.warning(
+            f"⛔ {tag}: STALE candle — last close was {age_seconds:.1f}s ago "
+            f"(max allowed {MAX_CANDLE_AGE_SECONDS}s). Rejecting signal instead "
+            f"of relabeling it as fresh — check DB pool / worker pool contention."
+        )
         return None
 
     entry_price = float(df["close"].iloc[-1])
@@ -319,8 +334,21 @@ def generate_signal(
 
     # ---- All gates passed ----
 
-    # Get signal timestamp from candle close time
-    signal_ts = _get_signal_timestamp(df, dt)
+    # Final freshness re-check — the indicator/structure/AI pipeline above
+    # takes real time. Re-verify against the ACTUAL current clock (not the
+    # `dt` captured at scan start) so a slow pipeline can't ship a now-stale
+    # signal under a timestamp that looks fresh.
+    final_now = datetime.utcnow()
+    final_age = (final_now - candle_dt).total_seconds()
+    if final_age > MAX_CANDLE_AGE_SECONDS:
+        logger.warning(
+            f"⛔ {tag}: STALE at emission — pipeline took too long "
+            f"(candle age now {final_age:.1f}s, was {age_seconds:.1f}s at scan start). "
+            f"Rejecting instead of sending a late signal."
+        )
+        return None
+
+    signal_ts = candle_dt
 
     reasons = _build_reasons(direction, struct, ind, pa, ai_score, signal_ts)
     expiry  = TF_EXPIRY[timeframe]
