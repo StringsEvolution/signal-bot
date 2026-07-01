@@ -105,6 +105,12 @@ def get_engine():
         _engine = create_engine(
             db_url,
             pool_pre_ping=True,
+            # 5 assets x 5 timeframes = 25 streams. Several timeframes close
+            # at the same clock minute (e.g. top of every hour: M1/M5/M15
+            # all close at once across all 5 assets = up to 15 simultaneous
+            # store_ohlc + load_ohlc calls). The old pool_size=5/overflow=5
+            # (10 total) queued under that load, adding real seconds of
+            # delay between candle close and signal generation/delivery.
             pool_size=20,
             max_overflow=15,
             pool_timeout=10,
@@ -734,14 +740,9 @@ def refresh_all():
         except Exception as exc:
             logger.error(f"All sources failed for {asset}/{tf}: {exc}")
 
-    missed = [p for p in pairs if p not in deriv_results]
-    if missed:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
-            futures = [executor.submit(finish_pair, a, tf) for a, tf in pairs]
-            concurrent.futures.wait(futures)
-    else:
-        for asset, tf in pairs:
-            finish_pair(asset, tf)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
+        futures = [executor.submit(finish_pair, a, tf) for a, tf in pairs]
+        concurrent.futures.wait(futures)
 
     elapsed = time.time() - start_time
     logger.info(f"⚡ All {len(pairs)} pairs refreshed in {elapsed:.1f}s")
