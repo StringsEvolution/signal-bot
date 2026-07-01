@@ -99,7 +99,7 @@ def run_live_bot():
     seed_pool.shutdown(wait=False)
 
     worker_pool = concurrent.futures.ThreadPoolExecutor(
-        max_workers=10, thread_name_prefix="signal-worker"
+        max_workers=25, thread_name_prefix="signal-worker"
     )
 
     # ----------------------------------------------------------------
