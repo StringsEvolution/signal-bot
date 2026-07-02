@@ -19,9 +19,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FilterResult:
-    allowed:  bool = True
-    reasons:  List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
+    allowed:          bool  = True
+    reasons:          List[str] = field(default_factory=list)
+    warnings:         List[str] = field(default_factory=list)
+    extra_confidence: float = 0.0   # added on top of the timeframe's base AI confidence threshold
 
 
 @dataclass
@@ -58,6 +59,23 @@ TRADING_WINDOWS = {
     "new_york": (13, 22),
     "overlap":  (13, 16),
 }
+
+# ---------------------------------------------------------------------------
+# Elevated-risk hours — NOT a hard block, just raises the AI confidence bar.
+#
+# Tune this from real data: run performance_tracker.get_hourly_breakdown()
+# over a week or two and add any UTC hour whose win rate is consistently
+# poor across assets. Started with 08:00-09:59 UTC (09:00-10:59 WAT) based
+# on reported underperformance — confirm/adjust once you have more hourly
+# data logged.
+# ---------------------------------------------------------------------------
+ELEVATED_RISK_HOURS_UTC = {8, 9}
+ELEVATED_RISK_CONFIDENCE_BOOST = 10.0  # percentage points added to the tf threshold
+
+
+def is_elevated_risk_hour(dt: Optional[datetime] = None) -> bool:
+    dt = dt or datetime.utcnow()
+    return dt.hour in ELEVATED_RISK_HOURS_UTC
 
 
 def get_current_session(dt: Optional[datetime] = None, asset: str = "") -> str:
@@ -308,7 +326,15 @@ def apply_filters(
         result.reasons.append(f"High spread: {spread_pct:.4f}% exceeds threshold for {asset}")
         return result
 
-    # 7. Warnings (non-blocking)
+    # 7. Elevated risk hour — non-blocking, raises the AI confidence bar
+    if is_elevated_risk_hour(dt):
+        result.extra_confidence = ELEVATED_RISK_CONFIDENCE_BOOST
+        result.warnings.append(
+            f"Elevated-risk hour ({dt.hour}:00 UTC) — requires "
+            f"+{ELEVATED_RISK_CONFIDENCE_BOOST:.0f}% extra AI confidence"
+        )
+
+    # 8. Warnings (non-blocking)
     session = get_current_session(dt, asset)
     if "Overlap" in session:
         result.warnings.append(f"{session} — highest liquidity ✓")
