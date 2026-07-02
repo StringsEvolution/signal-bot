@@ -212,6 +212,10 @@ def generate_signal(
         logger.info(f"⛔ {tag}: FILTER blocked — {filt.reasons[0] if filt.reasons else '?'}")
         return None
 
+    # Elevated-risk hours raise the bar instead of hard-blocking
+    if filt.extra_confidence:
+        tf_threshold += filt.extra_confidence
+
     # ---- Gate 3: Market structure ----
     struct = analyse_structure(df)
 
