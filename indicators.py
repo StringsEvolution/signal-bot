@@ -22,6 +22,7 @@ class IndicatorResult:
     rsi: float = 50.0
     rsi_zone: str = "neutral"      # "overbought" | "oversold" | "neutral"
     rsi_recovering: bool = False   # RSI was oversold/overbought and now recovering
+    rsi_recovery_dir: str = "none" # "bullish" (up from oversold) | "bearish" (down from overbought) | "none"
 
     # MACD
     macd_line: float = 0.0
@@ -156,13 +157,23 @@ def compute_indicators(df: pd.DataFrame) -> IndicatorResult:
     else:
         result.rsi_zone = "neutral"
 
-    # Recovering = was extreme, now moving back toward 50
+    # Recovering = was extreme, now moving back toward 50.
+    # Record the DIRECTION of recovery so downstream alignment gets the sign
+    # right: coming up from oversold is bullish; coming down from overbought
+    # is bearish. (Previously the alignment block inferred direction from the
+    # CURRENT zone, which mis-signed a recovery that had already climbed past
+    # 45 — scoring an oversold->up bounce as bearish.)
     if len(rsi_arr) >= 3:
         prev_rsi = float(rsi_arr[-3]) if not np.isnan(rsi_arr[-3]) else 50.0
-        result.rsi_recovering = (
-            (prev_rsi <= 30 and result.rsi > prev_rsi) or   # was oversold, rising
-            (prev_rsi >= 70 and result.rsi < prev_rsi)      # was overbought, falling
-        )
+        if prev_rsi <= 30 and result.rsi > prev_rsi:
+            result.rsi_recovering   = True
+            result.rsi_recovery_dir = "bullish"     # was oversold, rising
+        elif prev_rsi >= 70 and result.rsi < prev_rsi:
+            result.rsi_recovering   = True
+            result.rsi_recovery_dir = "bearish"     # was overbought, falling
+        else:
+            result.rsi_recovering   = False
+            result.rsi_recovery_dir = "none"
 
     # ----- MACD -----
     macd_line, signal_line, histogram = _macd(closes)
@@ -218,11 +229,13 @@ def compute_indicators(df: pd.DataFrame) -> IndicatorResult:
     else:
         bear += 0.1
 
-    # RSI recovering
+    # RSI recovering — sign follows the direction of recovery, not the
+    # current zone (a bounce up from oversold stays bullish even after RSI
+    # has climbed back above 45).
     if result.rsi_recovering:
-        if result.rsi_zone == "oversold" or (result.rsi < 45 and result.rsi > 30):
+        if result.rsi_recovery_dir == "bullish":
             bull += 0.15
-        else:
+        elif result.rsi_recovery_dir == "bearish":
             bear += 0.15
 
     # MACD
