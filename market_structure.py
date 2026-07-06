@@ -246,13 +246,18 @@ def analyse_structure(df: pd.DataFrame) -> StructureResult:
 
     # 2. S/R zones from swing highs/lows (full history, clustered)
     sh, sl = _find_swings(df, left=5, right=5)
-    resistance_zones = sorted(_cluster_levels(sh), reverse=True)
-    support_zones    = sorted(_cluster_levels(sl),  reverse=False)
+    # Full clustered level lists — kept for breakout detection, which needs
+    # levels on BOTH sides of price (a bullish break crosses a former
+    # resistance that is now at/below price). Filtering to r>price / s<price
+    # here would make _detect_breakout mathematically unable to ever fire.
+    all_resistance = sorted(_cluster_levels(sh), reverse=True)
+    all_support    = sorted(_cluster_levels(sl),  reverse=False)
 
-    # Keep only closest 5 each side to reduce noise
+    # Keep only closest 5 each side to reduce noise (used for at_support/
+    # at_resistance, pullback, nearest-level distance — NOT breakout).
     price = float(df["close"].iloc[-1])
-    resistance_zones = sorted([r for r in resistance_zones if r > price])[:5]
-    support_zones    = sorted([s for s in support_zones    if s < price], reverse=True)[:5]
+    resistance_zones = sorted([r for r in all_resistance if r > price])[:5]
+    support_zones    = sorted([s for s in all_support    if s < price], reverse=True)[:5]
 
     # 3. Nearest levels and distance
     nearest_sup = support_zones[0]    if support_zones    else None
@@ -269,8 +274,10 @@ def analyse_structure(df: pd.DataFrame) -> StructureResult:
     at_support    = nearest_sup is not None and abs(price - nearest_sup) / price < 0.0015
     at_resistance = nearest_res is not None and abs(price - nearest_res) / price < 0.0015
 
-    # 5. Breakout / fakeout
-    breakout, fakeout = _detect_breakout(df, resistance_zones, support_zones)
+    # 5. Breakout / fakeout — use FULL level lists so a level that price has
+    #    just crossed (now sitting at/below for a bull break, at/above for a
+    #    bear break) is still available to match against.
+    breakout, fakeout = _detect_breakout(df, all_resistance, all_support)
 
     # 6. Pullback — moved below so it uses effective_trend (resolved after EMA check)
 
