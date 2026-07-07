@@ -65,7 +65,8 @@ def run_live_bot():
     )
     from signal_engine import generate_signal
     from telegram_bot  import send_signal, send_admin_alert, BotCommandHandler
-    from performance_tracker import generate_daily_report, generate_weekly_report
+    from performance_tracker import generate_daily_report, generate_weekly_report, log_signal
+    from settlement import worker as settlement_worker
 
     logger.info("=" * 60)
     logger.info("  Signal Bot Pro — Starting (real-time streaming mode)")
@@ -78,6 +79,10 @@ def run_live_bot():
 
     cmd_handler = BotCommandHandler()
     cmd_handler.start()
+
+    # Start the settlement worker (BUG B): scores each fired signal win/loss
+    # once its expiry elapses, so daily/weekly reports actually populate.
+    settlement_worker.start()
 
     # ----------------------------------------------------------------
     # Startup seed — runs ONCE with the new parallel fetch (~8s).
@@ -139,6 +144,17 @@ def run_live_bot():
                 send_start = datetime.now(timezone.utc)
                 send_signal(sig)
                 send_done   = datetime.now(timezone.utc)
+
+                # Persist the signal and queue it for result settlement (BUG B).
+                # log_signal writes the row (result=NULL) and returns its id;
+                # the settlement worker fills in win/loss after expiry.
+                try:
+                    sig_id = log_signal(sig)
+                    if sig_id is not None:
+                        settlement_worker.log_pending(sig, sig_id)
+                except Exception as log_exc:
+                    logger.error(f"Signal logging/settlement queue failed: {log_exc}")
+
                 total_lag   = (send_done - close_dt).total_seconds()
                 telegram_ms = (send_done - send_start).total_seconds()
                 logger.info(
