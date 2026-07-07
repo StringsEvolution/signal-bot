@@ -45,12 +45,12 @@ def log_signal(signal, features: Optional[dict] = None) -> Optional[int]:
         with engine.connect() as conn:
             row = conn.execute(sql, {
                 "ts":      signal.timestamp,
-                "asset":   signal.asset,
-                "tf":      signal.timeframe,
-                "dir":     signal.direction,
-                "ep":      signal.entry_price,
-                "conf":    signal.confidence,
-                "exp":     signal.expiry_min,
+                "asset":   str(signal.asset),
+                "tf":      str(signal.timeframe),
+                "dir":     str(signal.direction),
+                "ep":      float(signal.entry_price),
+                "conf":    float(signal.confidence),
+                "exp":     int(signal.expiry_min),
                 "reasons": json.dumps(signal.reasons),
             })
             conn.commit()
