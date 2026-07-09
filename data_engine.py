@@ -43,6 +43,29 @@ DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=36544"
 
 
 # ---------------------------------------------------------------------------
+# Forming-candle registry
+# ---------------------------------------------------------------------------
+# The live stream publishes each in-progress (still-open) candle here so the
+# pre-alert worker can peek at it a few seconds before it closes. Keyed by
+# (asset, timeframe) -> snapshot dict {open_time, open, high, low, close}.
+import threading as _threading
+_forming_lock = _threading.Lock()
+_forming_candles: dict = {}
+
+
+def _publish_forming(asset: str, timeframe: str, snapshot: dict):
+    with _forming_lock:
+        _forming_candles[(asset, timeframe)] = dict(snapshot)
+
+
+def get_forming_candle(asset: str, timeframe: str) -> Optional[dict]:
+    """Return the latest in-progress candle snapshot, or None."""
+    with _forming_lock:
+        snap = _forming_candles.get((asset, timeframe))
+        return dict(snap) if snap else None
+
+
+# ---------------------------------------------------------------------------
 # Helper — force clean numeric/datetime dtypes (prevents segfault)
 # ---------------------------------------------------------------------------
 
@@ -368,6 +391,9 @@ async def _stream_asset(asset: str, timeframes: list, on_close, stop_event: asyn
                             "low":   float(c["low"]),
                             "close": float(c["close"]),
                         }
+                        # Publish the in-progress candle so the pre-alert worker
+                        # can peek at it a few seconds before it closes.
+                        _publish_forming(asset, tf, snapshot)
                         prev = last_candle.get(tf)
                         if prev is not None and prev["open_time"] != snapshot["open_time"]:
                             closed = prev
