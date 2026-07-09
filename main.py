@@ -67,6 +67,7 @@ def run_live_bot():
     from telegram_bot  import send_signal, send_admin_alert, BotCommandHandler
     from performance_tracker import generate_daily_report, generate_weekly_report, log_signal
     from settlement import worker as settlement_worker
+    from prealert import worker as prealert_worker
 
     logger.info("=" * 60)
     logger.info("  Signal Bot Pro — Starting (real-time streaming mode)")
@@ -83,6 +84,10 @@ def run_live_bot():
     # Start the settlement worker (BUG B): scores each fired signal win/loss
     # once its expiry elapses, so daily/weekly reports actually populate.
     settlement_worker.start()
+
+    # Start the pre-alert worker: heads-up a few seconds before a signal
+    # confirms, so users can set up on their platform in time.
+    prealert_worker.start()
 
     # ----------------------------------------------------------------
     # Startup seed — runs ONCE with the new parallel fetch (~8s).
