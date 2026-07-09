@@ -41,7 +41,7 @@ POLL_SECS = 3
 # How many seconds before a candle closes we send the heads-up.
 # Big enough to open the platform; small enough that the forming candle is
 # already close to its final shape.
-LEAD_SECS = 10
+LEAD_SECS = 20
 
 # Don't fire a heads-up if the candle is already within this many seconds of
 # close — too late to be useful, and the confirmed signal is imminent anyway.
