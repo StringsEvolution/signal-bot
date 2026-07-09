@@ -232,6 +232,46 @@ def _trade_keyboard(signal_key: str, amount: float, direction: str) -> dict:
 # Public send functions
 # ---------------------------------------------------------------------------
 
+def send_prealert(asset: str, timeframe: str, direction: str,
+                  confidence: float, seconds_left: int) -> dict:
+    """
+    Broadcast a provisional heads-up that a signal is likely forming on this
+    pair/timeframe, so users can get to their platform and set up before it
+    confirms at candle close. Pair + timing only — NOT the direction, which can
+    still change in the final seconds. The confirmed signal (with CALL/PUT)
+    follows when the candle closes.
+    """
+    results = {}
+    text = (
+        f"⏰ <b>GET READY</b>\n\n"
+        f"📊 Pair: <b>{asset}</b>\n"
+        f"⏱️ Timeframe: <b>{timeframe}</b>\n"
+        f"⏳ Signal may come in ~<b>{seconds_left}s</b> (next candle close)\n\n"
+        f"👉 Open <b>{asset}</b> now and get ready. "
+        f"Wait for the confirmed signal for direction."
+    )
+
+    tasks = []
+    if FREE_CHANNEL:
+        tasks.append(("free", FREE_CHANNEL))
+    if VIP_CHANNEL:
+        tasks.append(("vip", VIP_CHANNEL))
+
+    def _send_task(key, chat_id):
+        results[key] = _send_message(chat_id, text)
+
+    threads = [
+        threading.Thread(target=_send_task, args=(key, chat_id), daemon=True)
+        for key, chat_id in tasks
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=8)
+
+    return results
+
+
 def send_signal(signal) -> dict:
     results = {}
     sent_at = datetime.now(timezone.utc)   # capture ACTUAL send time here
