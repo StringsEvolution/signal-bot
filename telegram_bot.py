@@ -13,6 +13,8 @@ Commands:
   /balance      — Check Deriv balance
   /setamount    — Set default trade amount
   /myaccount    — View account settings
+  /connectpo    — Link Pocket Option account (OTC, self-service per-user)
+  /disconnectpo — Unlink Pocket Option account
 """
 
 import os
@@ -45,12 +47,17 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 _pending_trades: dict = {}   # signal_key → trade info
 _awaiting_amount: dict = {}  # chat_id → signal_key (user typing custom amount)
 
+# Pocket Option credential collection conversation state.
+# chat_id → {"stage": "session" | "uid" | "mode", "session": str, "uid": str}
+_awaiting_po_setup: dict = {}
+
 # Persistent reply keyboard shown at bottom of every chat
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
         [{"text": "📊 Pairs"},       {"text": "✅ Status"},     {"text": "📈 Stats"}],
         [{"text": "🔗 Connect"},     {"text": "💰 Balance"},    {"text": "👤 My Account"}],
         [{"text": "💵 Set Amount"},  {"text": "❌ Disconnect"}, {"text": "📖 Help"}],
+        [{"text": "🎯 Pocket Option"}],
     ],
     "resize_keyboard": True,
     "persistent": True,
@@ -351,6 +358,41 @@ def send_trade_prompts_to_subscribers(signal):
         logger.error(f"send_trade_prompts error: {exc}")
 
 
+def send_po_signal_to_users(signal) -> dict:
+    """
+    Pocket Option (OTC) signals do NOT go to the VIP/Free channels — those
+    stay pure Deriv. Instead this DMs every user who has connected their
+    own Pocket Option account via /connectpo.
+    """
+    results = {}
+    sent_at = datetime.now(timezone.utc)
+    try:
+        from user_manager import UserManager
+        users = UserManager().get_all_platform_users("pocket_option")
+    except Exception as exc:
+        logger.error(f"send_po_signal_to_users: could not load PO users — {exc}")
+        return results
+
+    if not users:
+        return results
+
+    text = _format_vip_message(signal, sent_at)  # reuse the detailed format
+
+    def _send_task(chat_id):
+        results[chat_id] = _send_message(chat_id, "🎯 <b>Pocket Option (OTC)</b>\n\n" + text)
+
+    threads = [
+        threading.Thread(target=_send_task, args=(u["telegram_id"],), daemon=True)
+        for u in users
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=12)
+
+    return results
+
+
 def send_admin_alert(text: str):
     if ADMIN_CHAT_ID:
         _send_message(ADMIN_CHAT_ID, f"🤖 <b>Bot Alert</b>\n\n{text}")
@@ -493,6 +535,82 @@ def _handle_callback(update: dict):
 
 
 # ---------------------------------------------------------------------------
+# Pocket Option credential conversation
+# ---------------------------------------------------------------------------
+
+def _handle_po_setup_input(chat_id: str, text: str):
+    """
+    Small stateful conversation, mirroring the pattern already used for
+    /setamount and per-signal amount entry (_awaiting_amount). Collects
+    PO_SESSION, then PO_UID, then demo/real, then saves via UserManager.
+    """
+    state = _awaiting_po_setup.get(chat_id)
+    if not state:
+        return
+
+    stage = state.get("stage")
+
+    if stage == "session":
+        state["session"] = text.strip()
+        state["stage"] = "uid"
+        _send_message(chat_id,
+            "✅ Session received.\n\n"
+            "Now send your Pocket Option <b>uid</b> (a number from the same "
+            "auth payload):"
+        )
+        return
+
+    if stage == "uid":
+        uid_raw = text.strip()
+        if not uid_raw.isdigit():
+            _send_message(chat_id, "❌ uid should be numbers only. Try again:")
+            return
+        state["uid"] = uid_raw
+        state["stage"] = "mode"
+        _send_message(chat_id,
+            "✅ uid received.\n\n"
+            "Is this a <b>demo</b> or <b>real</b> account? Reply with "
+            "<code>demo</code> or <code>real</code>:"
+        )
+        return
+
+    if stage == "mode":
+        mode = text.strip().lower()
+        if mode not in ("demo", "real"):
+            _send_message(chat_id, "❌ Please reply with <code>demo</code> or <code>real</code>:")
+            return
+
+        is_demo = mode == "demo"
+        try:
+            from user_manager import UserManager
+            ok = UserManager().save_platform_credentials(
+                telegram_id=chat_id,
+                platform="pocket_option",
+                credentials={"session": state["session"], "uid": state["uid"]},
+                is_demo=is_demo,
+            )
+        except Exception as exc:
+            ok = False
+            logger.error(f"save_platform_credentials failed: {exc}")
+
+        _awaiting_po_setup.pop(chat_id, None)
+
+        if ok:
+            _send_message(chat_id,
+                f"✅ <b>Pocket Option connected!</b> ({'DEMO' if is_demo else 'REAL'})\n\n"
+                f"You'll start receiving OTC signals sourced from your Pocket "
+                f"Option feed on the next scan cycle.\n"
+                f"Use /disconnectpo anytime to unlink."
+            )
+        else:
+            _send_message(chat_id,
+                "❌ Couldn't save your Pocket Option credentials. Please try "
+                "/connectpo again."
+            )
+        return
+
+
+# ---------------------------------------------------------------------------
 # Command handler
 # ---------------------------------------------------------------------------
 
@@ -608,6 +726,11 @@ class BotCommandHandler:
                 )
                 return
 
+        # --- Check if user is mid-flow entering Pocket Option credentials ---
+        if chat_id in _awaiting_po_setup and not text.startswith("/"):
+            _handle_po_setup_input(chat_id, text)
+            return
+
         # Map button texts to commands
         button_map = {
             "📊 Pairs":       "/pairs",
@@ -619,12 +742,20 @@ class BotCommandHandler:
             "💵 Set Amount":  "/setamount",
             "❌ Disconnect":  "/disconnect",
             "📖 Help":        "/help",
+            "🎯 Pocket Option": "/connectpo",
         }
         if text in button_map:
             text = button_map[text]
 
         # --- Commands ---
         if text.startswith("/start"):
+            first_name = msg.get("from", {}).get("first_name", "")
+            try:
+                from user_manager import UserManager
+                UserManager().register_user_from_telegram(chat_id, username, first_name)
+            except Exception as exc:
+                logger.error(f"register_user_from_telegram failed: {exc}")
+
             _send_message(chat_id,
                 "👋 Welcome to <b>Signal Bot Pro</b>!\n\n"
                 "I generate high-confidence binary options signals using "
@@ -633,10 +764,39 @@ class BotCommandHandler:
                 "🟢 <b>CALL ↑</b> — Price expected to RISE\n"
                 "🔴 <b>PUT ↓</b> — Price expected to FALL\n\n"
                 "Use the menu buttons below to get started.\n"
-                "Connect your Deriv account to execute trades directly from signals.\n\n"
+                "Connect your Deriv account to execute trades directly from signals, "
+                "or connect Pocket Option (OTC) with 🎯 Pocket Option.\n\n"
                 "⚠️ <i>Trading involves significant risk. Never invest more than you can afford to lose.</i>",
                 reply_markup=MAIN_MENU_KEYBOARD
             )
+
+        # NOTE: /connectpo and /disconnectpo are checked BEFORE the plain
+        # /connect and /disconnect branches below, since str.startswith
+        # would otherwise let "/connect" swallow "/connectpo" first.
+        elif text.startswith("/connectpo"):
+            _awaiting_po_setup[chat_id] = {"stage": "session"}
+            _send_message(chat_id,
+                "🎯 <b>Connect Pocket Option (OTC)</b>\n\n"
+                "This links your OWN Pocket Option account so you get "
+                "signals sourced from Pocket Option's OTC feed.\n\n"
+                "Steps:\n"
+                "1. Log in to Pocket Option in your browser\n"
+                "2. Open DevTools → Application/Storage → cookies (or the "
+                "network tab) and copy your <b>session</b> value\n\n"
+                "Send me your session value now:"
+            )
+
+        elif text.startswith("/disconnectpo"):
+            try:
+                from user_manager import UserManager
+                UserManager().remove_platform_credentials(chat_id, "pocket_option")
+                _awaiting_po_setup.pop(chat_id, None)
+                _send_message(chat_id,
+                    "✅ <b>Pocket Option disconnected.</b>\n\n"
+                    "Use 🎯 Pocket Option anytime to reconnect."
+                )
+            except Exception as exc:
+                _send_message(chat_id, f"❌ Error: {exc}")
 
         elif text.startswith("/connect"):
             parts = text.split(maxsplit=1)
@@ -751,14 +911,27 @@ class BotCommandHandler:
                 connected_at = sub.get("connected_at")
                 connected_str = _to_wat(connected_at).strftime('%Y-%m-%d %H:%M WAT') \
                     if connected_at else "N/A"
+
+                po_line = "❌ Not connected"
+                try:
+                    from user_manager import UserManager
+                    po = UserManager().get_platform_credentials(chat_id, "pocket_option")
+                    if po and po.get("active"):
+                        po_line = f"✅ Connected ({'DEMO' if po['is_demo'] else 'REAL'})"
+                except Exception:
+                    pass
+
                 _send_message(chat_id,
                     f"👤 <b>My Account</b>\n\n"
                     f"Deriv: {connected}\n"
                     f"Connected: {connected_str}\n"
                     f"Default trade amount: <b>${sub['trade_amount']:.2f}</b>\n\n"
+                    f"🎯 Pocket Option: {po_line}\n\n"
                     f"/balance     — Check live balance\n"
                     f"/setamount   — Change default amount\n"
-                    f"/disconnect  — Unlink account"
+                    f"/disconnect  — Unlink Deriv account\n"
+                    f"/connectpo   — Connect Pocket Option\n"
+                    f"/disconnectpo — Unlink Pocket Option"
                 )
             except Exception as exc:
                 _send_message(chat_id, f"❌ Error: {exc}")
@@ -815,6 +988,8 @@ class BotCommandHandler:
                 "/balance     — Check Deriv balance\n"
                 "/setamount   — Set default trade amount\n"
                 "/myaccount   — View your settings\n"
+                "/connectpo   — Connect Pocket Option (OTC)\n"
+                "/disconnectpo — Unlink Pocket Option\n"
                 "/status      — Bot health &amp; uptime\n"
                 "/stats       — Today's win/loss report\n"
                 "/pairs       — Assets &amp; timeframes\n"
