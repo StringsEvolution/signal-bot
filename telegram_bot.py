@@ -51,13 +51,24 @@ _awaiting_amount: dict = {}  # chat_id → signal_key (user typing custom amount
 # chat_id → {"stage": "session" | "uid" | "mode", "session": str, "uid": str}
 _awaiting_po_setup: dict = {}
 
-# Persistent reply keyboard shown at bottom of every chat
+# Persistent reply keyboard shown at bottom of every chat.
+#
+# Grouped by purpose so every button is visible and nothing is buried:
+#   Row 1 — Info / monitoring
+#   Row 2 — Deriv platform (real market → VIP channel signals)
+#   Row 3 — Pocket Option platform (OTC → private DM signals)
+#   Row 4 — Settings / account
+#
+# NOTE: Telegram caches this keyboard client-side. It only refreshes when the
+# bot sends a message carrying `reply_markup`, so it is attached to several
+# commands below (/start, /help, /status, /myaccount) — not just /start. That
+# way a redeploy can never leave users stuck on a stale menu.
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
-        [{"text": "📊 Pairs"},       {"text": "✅ Status"},     {"text": "📈 Stats"}],
-        [{"text": "🔗 Connect"},     {"text": "💰 Balance"},    {"text": "👤 My Account"}],
-        [{"text": "💵 Set Amount"},  {"text": "❌ Disconnect"}, {"text": "📖 Help"}],
-        [{"text": "🎯 Pocket Option"}],
+        [{"text": "📊 Pairs"},          {"text": "📈 Stats"},           {"text": "✅ Status"}],
+        [{"text": "🔗 Connect Deriv"},  {"text": "💰 Balance"},         {"text": "❌ Disconnect"}],
+        [{"text": "🎯 Connect OTC"},    {"text": "🔌 Disconnect OTC"}],
+        [{"text": "💵 Set Amount"},     {"text": "👤 My Account"},      {"text": "📖 Help"}],
     ],
     "resize_keyboard": True,
     "persistent": True,
@@ -815,18 +826,28 @@ class BotCommandHandler:
             _handle_po_setup_input(chat_id, text)
             return
 
-        # Map button texts to commands
+        # Map button texts to commands.
+        # IMPORTANT: "🎯 Connect OTC" and "🔌 Disconnect OTC" map to
+        # /connectpo and /disconnectpo, which are matched BEFORE the plain
+        # /connect and /disconnect branches below (startswith would otherwise
+        # let "/connect" swallow "/connectpo").
         button_map = {
-            "📊 Pairs":       "/pairs",
-            "✅ Status":      "/status",
-            "📈 Stats":       "/stats",
-            "🔗 Connect":     "/connect",
-            "💰 Balance":     "/balance",
-            "👤 My Account":  "/myaccount",
-            "💵 Set Amount":  "/setamount",
-            "❌ Disconnect":  "/disconnect",
-            "📖 Help":        "/help",
-            "🎯 Pocket Option": "/connectpo",
+            "📊 Pairs":           "/pairs",
+            "📈 Stats":           "/stats",
+            "✅ Status":          "/status",
+            "🔗 Connect Deriv":   "/connect",
+            "💰 Balance":         "/balance",
+            "❌ Disconnect":      "/disconnect",
+            "🎯 Connect OTC":     "/connectpo",
+            "🔌 Disconnect OTC":  "/disconnectpo",
+            "💵 Set Amount":      "/setamount",
+            "👤 My Account":      "/myaccount",
+            "📖 Help":            "/help",
+            # Back-compat with the old menu labels, so users whose Telegram
+            # still shows the previous cached keyboard don't hit "Unknown
+            # command" before it refreshes.
+            "🔗 Connect":         "/connect",
+            "🎯 Pocket Option":   "/connectpo",
         }
         if text in button_map:
             text = button_map[text]
@@ -1015,7 +1036,8 @@ class BotCommandHandler:
                     f"/setamount   — Change default amount\n"
                     f"/disconnect  — Unlink Deriv account\n"
                     f"/connectpo   — Connect Pocket Option\n"
-                    f"/disconnectpo — Unlink Pocket Option"
+                    f"/disconnectpo — Unlink Pocket Option",
+                    reply_markup=MAIN_MENU_KEYBOARD
                 )
             except Exception as exc:
                 _send_message(chat_id, f"❌ Error: {exc}")
@@ -1032,7 +1054,8 @@ class BotCommandHandler:
                 f"  Interval: every 60s\n\n"
                 f"🟢 CALL = Price rising | 🔴 PUT = Price falling\n\n"
                 f"🤖 AI mode: {'ML model' if _ml_model_loaded() else 'Heuristic (pre-training)'}\n"
-                f"🔒 Confidence: M1/M2/M3=60-65% | M5/M15=80%"
+                f"🔒 Confidence: M1/M2/M3=60-65% | M5/M15=80%",
+                reply_markup=MAIN_MENU_KEYBOARD
             )
 
         elif text.startswith("/stats"):
@@ -1083,7 +1106,8 @@ class BotCommandHandler:
                 "<b>How to trade from bot:</b>\n"
                 "1. Connect with /connect\n"
                 "2. When signal arrives, tap ➖ ➕ or ✏️ to set amount\n"
-                "3. Tap ✅ Place CALL/PUT to execute instantly"
+                "3. Tap ✅ Place CALL/PUT to execute instantly",
+                reply_markup=MAIN_MENU_KEYBOARD
             )
 
         else:
