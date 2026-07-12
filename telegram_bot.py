@@ -314,6 +314,125 @@ def send_signal(signal) -> dict:
     return results
 
 
+# ---------------------------------------------------------------------------
+# OTC (Pocket Option) — PRIVATE per-user delivery
+#
+# OTC signals are intentionally NOT broadcast to the VIP / Free channels.
+# They are delivered privately, straight into the bot DM of each user who
+# has linked their own Pocket Option account via /connectpo, and only for
+# the assets that user subscribes to. Non-OTC signals keep going to the VIP
+# channel exactly as before (send_signal above is untouched).
+# ---------------------------------------------------------------------------
+
+def _otc_display_asset(asset: str) -> str:
+    """Turn an internal OTC storage code (e.g. 'EURUSD_otc') into a clean
+    display label (e.g. 'EURUSD OTC')."""
+    base = asset.replace("_otc", "").replace("_OTC", "").rstrip("_")
+    return f"{base} OTC"
+
+
+def _format_otc_message(signal, sent_at: datetime = None) -> str:
+    is_call = signal.direction == "CALL"
+    icon    = "🟢" if is_call else "🔴"
+    label   = "CALL ↑ BUY" if is_call else "PUT ↓ SELL"
+    action  = "📈 Price expected to RISE — place a CALL/BUY trade" if is_call \
+              else "📉 Price expected to FALL — place a PUT/SELL trade"
+    r_icon  = "✅" if is_call else "🔻"
+    sent_at = sent_at or datetime.now(timezone.utc)
+
+    if signal.reasons:
+        reasons_html = "\n".join(f"  {r_icon} {r}" for r in signal.reasons)
+    else:
+        reasons_html = f"  {r_icon} Signal confirmed by market structure, indicators and AI"
+
+    warn_html = ""
+    if signal.warnings:
+        warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
+
+    sent_str   = _to_wat(sent_at).strftime('%Y-%m-%d %H:%M:%S')
+    candle_str = _to_wat(signal.timestamp).strftime('%H:%M:%S')
+    lag_sec    = int((sent_at.replace(tzinfo=timezone.utc) - signal.timestamp.replace(tzinfo=timezone.utc)).total_seconds())
+    lag_note   = f" (+{lag_sec}s delivery)" if lag_sec > 2 else ""
+
+    return (
+        f"🎯 <b>OTC Signal</b> (Pocket Option) — {icon} {label}\n\n"
+        f"{action}\n\n"
+        f"📊 <b>Pair:</b>       {_otc_display_asset(signal.asset)}\n"
+        f"📈 <b>Timeframe:</b>  {signal.timeframe}\n"
+        f"⏳ <b>Expiry:</b>     {signal.expiry_min} minutes\n"
+        f"💰 <b>Entry:</b>      <code>{signal.entry_price:.5f}</code>\n"
+        f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
+        f"🌍 <b>Session:</b>    {signal.session}\n"
+        f"🕒 <b>Sent (WAT):</b> <b>{sent_str}</b>{lag_note}\n"
+        f"📊 <b>Candle time:</b> {candle_str} WAT\n\n"
+        f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
+        f"⚠️ <i>OTC markets are broker-generated. Binary options carry significant "
+        f"financial risk. Never trade with money you cannot afford to lose.</i>"
+    )
+
+
+def _otc_asset_matches(user_assets, signal_asset: str) -> bool:
+    """True if this OTC signal's asset is in the user's subscribed list.
+    An empty list means the user receives all OTC assets."""
+    if not user_assets:
+        return True
+    target = signal_asset.upper().replace("_OTC", "").rstrip("_")
+    for a in user_assets:
+        if a.upper().replace("_OTC", "").rstrip("_") == target:
+            return True
+    return False
+
+
+def send_otc_signal(signal) -> dict:
+    """
+    Deliver an OTC (Pocket Option) signal PRIVATELY into the bot — one DM
+    per connected Pocket Option user, filtered to the assets they subscribe
+    to. This never posts to the VIP or Free channels.
+
+    Returns {telegram_id: bool} for each user a delivery was attempted for.
+    Safe to call when no users are connected (logs and returns empty).
+    """
+    results: dict = {}
+    sent_at = datetime.now(timezone.utc)
+
+    try:
+        from user_manager import UserManager
+        po_users = UserManager().get_all_platform_users("pocket_option")
+    except Exception as exc:
+        logger.error(f"send_otc_signal: could not load Pocket Option users — {exc}")
+        return results
+
+    if not po_users:
+        logger.info(
+            "send_otc_signal: no Pocket Option users connected — "
+            "OTC signal not delivered (nothing sent to VIP/Free, by design)."
+        )
+        return results
+
+    text = _format_otc_message(signal, sent_at)
+
+    def _send_task(tid: str):
+        results[tid] = _send_message(tid, text)
+
+    threads = []
+    for u in po_users:
+        if not _otc_asset_matches(u.get("assets"), signal.asset):
+            continue
+        tid = str(u["telegram_id"])
+        t = threading.Thread(target=_send_task, args=(tid,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=12)
+
+    logger.info(
+        f"send_otc_signal: {signal.asset}/{signal.timeframe} "
+        f"{signal.direction} delivered privately to {len(results)} PO user(s)."
+    )
+    return results
+
+
 def _send_trade_prompt(chat_id: str, signal):
     """Send trade prompt with buttons to a subscriber."""
     try:
@@ -356,41 +475,6 @@ def send_trade_prompts_to_subscribers(signal):
                 logger.error(f"Trade prompt error for {sub['chat_id']}: {exc}")
     except Exception as exc:
         logger.error(f"send_trade_prompts error: {exc}")
-
-
-def send_po_signal_to_users(signal) -> dict:
-    """
-    Pocket Option (OTC) signals do NOT go to the VIP/Free channels — those
-    stay pure Deriv. Instead this DMs every user who has connected their
-    own Pocket Option account via /connectpo.
-    """
-    results = {}
-    sent_at = datetime.now(timezone.utc)
-    try:
-        from user_manager import UserManager
-        users = UserManager().get_all_platform_users("pocket_option")
-    except Exception as exc:
-        logger.error(f"send_po_signal_to_users: could not load PO users — {exc}")
-        return results
-
-    if not users:
-        return results
-
-    text = _format_vip_message(signal, sent_at)  # reuse the detailed format
-
-    def _send_task(chat_id):
-        results[chat_id] = _send_message(chat_id, "🎯 <b>Pocket Option (OTC)</b>\n\n" + text)
-
-    threads = [
-        threading.Thread(target=_send_task, args=(u["telegram_id"],), daemon=True)
-        for u in users
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=12)
-
-    return results
 
 
 def send_admin_alert(text: str):
