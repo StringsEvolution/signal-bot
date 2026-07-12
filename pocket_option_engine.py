@@ -45,10 +45,14 @@ PLATFORM = "pocket_option"
 TF_MINUTES = {"M1": 1, "M2": 2, "M3": 3, "M5": 5, "M15": 15}
 
 # Default OTC watchlist if a user hasn't set their own PO_ASSETS.
+# NOTE: Pocket Option's symbol names can differ from these (e.g. gold may be
+# listed as "Gold OTC"). _po_asset_code() normalizes whatever the broker sends,
+# but if an asset never streams, check the exact symbol name in your PO account
+# and set PO_ASSETS accordingly.
 DEFAULT_PO_ASSETS = [
     a.strip() for a in os.getenv(
         "PO_ASSETS",
-        "EURUSD_otc,GBPUSD_otc,EURJPY_otc,AUDCAD_otc,USDJPY_otc"
+        "EURUSD_otc,GBPUSD_otc,XAUUSD_otc,EURJPY_otc,AUDCAD_otc,USDJPY_otc"
     ).split(",") if a.strip()
 ]
 
@@ -173,13 +177,24 @@ def _extract_asset_and_price(item) -> Optional[tuple]:
 
 def _po_asset_code(raw_asset: str) -> str:
     """Normalize a Pocket Option asset name to our `_otc` storage code,
-    truncated to fit the existing VARCHAR(10) `asset` column."""
-    code = raw_asset.upper().replace("/", "").replace("-", "")
-    if not code.endswith("OTC"):
-        code = code.replace("_OTC", "") + "_otc"
-    else:
-        code = code[:-3].rstrip("_") + "_otc"
-    return code[:10]
+    kept within the existing VARCHAR(10) `asset` column.
+
+    Standard 6-char FX pairs fit exactly: EURUSD -> EURUSD_otc (10 chars).
+    For longer symbols (e.g. BITCOIN) we truncate the BASE and always keep
+    the `_otc` suffix intact — truncating the whole string would strip the
+    suffix (BITCOIN_ot) and break asset matching + display.
+    """
+    MAX_LEN = 10
+    SUFFIX  = "_otc"
+
+    code = raw_asset.upper().replace("/", "").replace("-", "").replace(" ", "")
+    # Strip any existing OTC marker to get the clean base symbol.
+    if code.endswith("OTC"):
+        code = code[:-3]
+    code = code.replace("_OTC", "").rstrip("_")
+
+    base = code[: MAX_LEN - len(SUFFIX)]   # leave room for "_otc"
+    return base + SUFFIX
 
 
 # ---------------------------------------------------------------------------
