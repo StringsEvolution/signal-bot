@@ -64,7 +64,7 @@ def run_live_bot():
         run_streaming_engine, ASSETS, TIMEFRAMES, TF_MINUTES,
     )
     from signal_engine import generate_signal
-    from telegram_bot  import send_signal, send_admin_alert, BotCommandHandler
+    from telegram_bot  import send_signal, send_otc_signal, send_admin_alert, BotCommandHandler
     from performance_tracker import generate_daily_report, generate_weekly_report, log_signal
     from settlement import worker as settlement_worker
     from prealert import worker as prealert_worker
@@ -74,8 +74,9 @@ def run_live_bot():
     logger.info("=" * 60)
 
     init_db()
-    from user_manager import init_user_tables
+    from user_manager import init_user_tables, init_platform_tables
     init_user_tables()
+    init_platform_tables()
     send_admin_alert("🚀 Signal Bot Pro is now online and streaming markets live.")
 
     cmd_handler = BotCommandHandler()
@@ -111,6 +112,68 @@ def run_live_bot():
     worker_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=25, thread_name_prefix="signal-worker"
     )
+
+    # ----------------------------------------------------------------
+    # Pocket Option (OTC) — per-user streams, fully additive.
+    #
+    # Runs on its own background thread + event loop so it never
+    # competes with the Deriv streaming loop above. store_ohlc() writes
+    # Pocket Option candles under an "_otc" suffixed asset code (e.g.
+    # "EURUSD_otc") into the SAME ohlc_data table Deriv uses, so
+    # generate_signal() below works identically for both sources.
+    #
+    # If the `pocket-option` package isn't installed, or no user has
+    # connected an account yet (via /connectpo), this quietly no-ops —
+    # it never affects the Deriv signal pipeline.
+    # ----------------------------------------------------------------
+    # Dedup guard: several users can stream the SAME OTC asset, so this
+    # handler may fire multiple times for one candle. We only want to
+    # generate + deliver the signal once per (asset, timeframe, candle).
+    _otc_seen: dict = {}
+    _otc_seen_lock = threading.Lock()
+
+    def _handle_po_candle_close(asset: str, tf: str, candle: dict):
+        try:
+            # --- Deduplicate across concurrent user streams ---
+            key    = f"{asset}|{tf}|{candle['open_time']}"
+            now_ts = time.time()
+            with _otc_seen_lock:
+                # Evict stale keys (older than 2 minutes) so this stays small.
+                for k in [k for k, v in _otc_seen.items() if now_ts - v > 120]:
+                    _otc_seen.pop(k, None)
+                if key in _otc_seen:
+                    return  # already handled this exact OTC candle
+                _otc_seen[key] = now_ts
+
+            close_epoch = candle["open_time"] + TF_MINUTES[tf] * 60
+            close_dt    = datetime.fromtimestamp(close_epoch, tz=timezone.utc)
+            now         = datetime.now(timezone.utc)
+
+            sig = generate_signal(asset, tf, dt=now)
+            if sig:
+                logger.info(f"  → OTC SIGNAL: {asset}/{tf} {sig.direction} conf={sig.confidence:.0f}%")
+                # OTC signals go PRIVATELY into the bot (per-user DMs),
+                # NOT to the VIP/Free channels. Non-OTC Deriv signals
+                # continue to use send_signal() → VIP channel unchanged.
+                send_otc_signal(sig)
+                try:
+                    sig_id = log_signal(sig)
+                    if sig_id is not None:
+                        settlement_worker.log_pending(sig, sig_id)
+                except Exception as log_exc:
+                    logger.error(f"OTC signal logging/settlement queue failed: {log_exc}")
+        except Exception as exc:
+            logger.error(f"Pocket Option candle-close handler error {asset}/{tf}: {exc}", exc_info=True)
+
+    def _on_po_candle(asset: str, tf: str, candle: dict):
+        worker_pool.submit(_handle_po_candle_close, asset, tf, candle)
+
+    po_engine_thread = None
+    try:
+        from pocket_option_engine import start_pocket_option_engine
+        po_engine_thread = start_pocket_option_engine(on_candle=_on_po_candle)
+    except Exception as exc:
+        logger.warning(f"Pocket Option engine could not be started: {exc}")
 
     # ----------------------------------------------------------------
     # Fires the instant a candle closes for one asset/timeframe.
@@ -263,6 +326,73 @@ def run_live_bot():
                 logger.error(f"Backfill refresh failed: {exc}")
 
     threading.Thread(target=_backfill_loop, name="Backfill", daemon=True).start()
+
+    # ----------------------------------------------------------------
+    # Pocket Option watchdog — observational + self-heal.
+    #
+    # Checks the OTC engine's heartbeat every 2 minutes. If the engine
+    # thread was started and then either DIES (auto-restart it) or STALLS
+    # (alive but not cycling — alert admin), it's surfaced instead of
+    # failing silently. This is entirely OTC-scoped: the Deriv streaming
+    # loop below is never affected, and if the SDK isn't installed the
+    # watchdog stays quiet (engine never reports "started").
+    # ----------------------------------------------------------------
+    def _po_watchdog_loop():
+        nonlocal po_engine_thread
+        try:
+            from pocket_option_engine import get_engine_health, start_pocket_option_engine
+        except Exception as exc:
+            logger.warning(f"[watchdog] Pocket Option health unavailable: {exc}")
+            return
+
+        STALE_AFTER = 900   # seconds — comfortably beyond 2 rescan cycles (300s)
+        stale_alerted = False
+
+        while not _stop_event.is_set():
+            _stop_event.wait(timeout=120)
+            if _stop_event.is_set():
+                break
+            try:
+                if po_engine_thread is None:
+                    continue
+
+                health = get_engine_health()
+                if not health.get("started"):
+                    # SDK absent or engine hasn't begun cycling yet — not a fault.
+                    continue
+
+                # Case 1: thread died outright — try to bring it back.
+                if not po_engine_thread.is_alive():
+                    logger.error("[watchdog] Pocket Option engine thread died — attempting restart.")
+                    try:
+                        po_engine_thread = start_pocket_option_engine(on_candle=_on_po_candle)
+                        send_admin_alert(
+                            "♻️ Pocket Option engine thread had stopped and was "
+                            "auto-restarted. Deriv signals were unaffected."
+                        )
+                    except Exception as exc:
+                        logger.error(f"[watchdog] restart failed: {exc}")
+                        send_admin_alert(f"⚠️ Pocket Option engine died and restart failed: {exc}")
+                    continue
+
+                # Case 2: thread alive but heartbeat is stale (stuck cycle).
+                age = health.get("age_seconds")
+                if age is not None and age > STALE_AFTER:
+                    if not stale_alerted:
+                        logger.error(f"[watchdog] Pocket Option heartbeat stale ({age}s).")
+                        send_admin_alert(
+                            f"⚠️ Pocket Option engine hasn't cycled in {age:.0f}s — "
+                            f"OTC signals may be paused. Deriv signals unaffected."
+                        )
+                        stale_alerted = True
+                elif stale_alerted:
+                    logger.info("[watchdog] Pocket Option engine recovered.")
+                    send_admin_alert("✅ Pocket Option engine recovered — OTC streaming healthy again.")
+                    stale_alerted = False
+            except Exception as exc:
+                logger.error(f"[watchdog] loop error: {exc}", exc_info=True)
+
+    threading.Thread(target=_po_watchdog_loop, name="PocketOptionWatchdog", daemon=True).start()
 
     logger.info(f"Opening live streams for {len(ASSETS)} assets × {len(TIMEFRAMES)} timeframes...")
 
