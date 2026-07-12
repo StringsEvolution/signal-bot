@@ -39,6 +39,33 @@ class NewsEvent:
 # Default dead hours for most forex pairs (European/American assets)
 DEAD_HOURS_UTC = list(range(22, 24)) + list(range(0, 7))
 
+# ---------------------------------------------------------------------------
+# OTC (Pocket Option) awareness
+#
+# OTC instruments are stored with an `_otc` suffix (e.g. XAUUSD_otc) to keep
+# their broker-generated price series separate from the real-market series.
+# The filters below are keyed on real-market symbols, so without these helpers
+# every OTC asset would silently miss its config and fall back to defaults —
+# e.g. XAUUSD_otc would miss gold's wide-spread allowance and be over-filtered.
+#
+# Two rules define OTC behaviour:
+#   * It quotes 24/7 (weekends included) — session/weekend gates don't apply.
+#   * Its config (spread, currencies) should resolve via the BASE symbol.
+# ---------------------------------------------------------------------------
+
+def is_otc_asset(asset: str) -> bool:
+    """True if this is a Pocket Option OTC instrument (e.g. 'XAUUSD_otc')."""
+    return bool(asset) and asset.upper().endswith("_OTC")
+
+
+def base_symbol(asset: str) -> str:
+    """Strip the OTC suffix to get the real-market symbol used as a config key.
+    'XAUUSD_otc' -> 'XAUUSD'.  Non-OTC assets are returned unchanged."""
+    if is_otc_asset(asset):
+        return asset[:-4].upper()
+    return asset
+
+
 # Asset-specific dead hours
 # EURUSD — European asset, block full Asian dead zone
 # GBPUSD — European asset, block full Asian dead zone
@@ -63,6 +90,15 @@ TRADING_WINDOWS = {
 def get_current_session(dt: Optional[datetime] = None, asset: str = "") -> str:
     dt = dt or datetime.utcnow()
     h  = dt.hour
+
+    # OTC instruments quote 24/7 and don't follow real-market sessions. Report
+    # the clock context without implying real-market liquidity.
+    if is_otc_asset(asset):
+        if 13 <= h < 16:
+            return "OTC (Peak Hours)"
+        if 7 <= h < 22:
+            return "OTC (Active)"
+        return "OTC (24/7)"
 
     if asset == "USDJPY":
         if 0 <= h < 9:
@@ -99,6 +135,12 @@ def get_current_session(dt: Optional[datetime] = None, asset: str = "") -> str:
 def is_dead_session(dt: Optional[datetime] = None, asset: str = "") -> bool:
     dt = dt or datetime.utcnow()
     h  = dt.hour
+
+    # OTC (Pocket Option) instruments are broker-generated and quote 24/7,
+    # including weekends. Real-market session dead zones do not apply to them,
+    # so never block an OTC asset on session hours.
+    if is_otc_asset(asset):
+        return False
 
     # Use asset-specific dead hours if available
     if asset and asset in ASSET_DEAD_HOURS:
@@ -214,9 +256,14 @@ def is_near_news(asset: str, dt: Optional[datetime] = None, window_min: int = 30
     events = get_news_events()
     asset_currencies = set()
 
-    if len(asset) == 6:
-        asset_currencies = {asset[:3], asset[3:]}
-    elif asset == "XAUUSD":
+    # Resolve the real-market symbol first: 'XAUUSD_otc' is 10 chars, so
+    # without this the length check below would silently match nothing and
+    # no news filtering would be applied at all.
+    sym = base_symbol(asset)
+
+    if len(sym) == 6:
+        asset_currencies = {sym[:3], sym[3:]}
+    elif sym == "XAUUSD":
         asset_currencies = {"USD", "XAU"}
 
     window = timedelta(minutes=window_min)
@@ -246,7 +293,11 @@ def is_high_spread(asset: str, spread_pct: float) -> bool:
         "USDJPY": 0.01,
         "BTCUSD": 0.50,
     }
-    return spread_pct > MAX_SPREAD.get(asset, 0.02)
+    # Resolve via the BASE symbol so OTC variants inherit the right threshold.
+    # Without this, XAUUSD_otc would miss gold's 0.05 allowance and fall back
+    # to the 0.02 default — wrongly rejecting most gold OTC signals as
+    # "high spread", since gold's spread is naturally wide.
+    return spread_pct > MAX_SPREAD.get(base_symbol(asset), 0.02)
 
 
 # ---------------------------------------------------------------------------
@@ -264,9 +315,13 @@ def apply_filters(
 ) -> FilterResult:
     result = FilterResult()
     dt     = dt or datetime.utcnow()
+    otc    = is_otc_asset(asset)
 
-    # 1. Weekend
-    if is_weekend(dt):
+    # 1. Weekend — real markets only.
+    #    OTC (Pocket Option) instruments are broker-generated and quote through
+    #    the weekend; blocking them here would disable OTC signals on exactly
+    #    the days OTC is most useful. Real-market assets are gated as before.
+    if not otc and is_weekend(dt):
         result.allowed = False
         result.reasons.append("Weekend — markets closed")
         return result
