@@ -13,3 +13,5 @@ uvicorn[standard]>=0.24.0
 python-telegram-bot>=20.0
 matplotlib>=3.7.0
 websockets>=11.0
+cryptography>=42.0.0 
+pocket-option>=0.1.6
