@@ -341,7 +341,7 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
         await client.connect(
             PO_WS_URL,
             headers=po_headers,
-            auth=auth_data,
+            auth=auth_data.model_dump(by_alias=True),
             wait=True,
             wait_timeout=float(os.getenv("PO_CONNECT_TIMEOUT", "20")),
         )
