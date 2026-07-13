@@ -308,11 +308,25 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
                         f"failed for {code}/{tf} — {exc}"
                     )
 
+    # The SDK's connect() requires the WebSocket URL as a positional argument.
+    # Pocket Option runs several regional endpoints, so this is env-driven:
+    # copy the exact URL from DevTools → Network → Socket → click the socket →
+    # Headers → Request URL, then set it as PO_WS_URL in Railway. The inner
+    # TypeError fallback covers SDK versions whose runner takes no argument.
+    PO_WS_URL = os.getenv(
+        "PO_WS_URL",
+        "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+    )
+
     try:
         runner = getattr(client, "run", None) or getattr(client, "connect", None)
         if runner is None:
             raise RuntimeError("pocket_option client has neither .run() nor .connect()")
-        await runner()
+        try:
+            await runner(PO_WS_URL)
+        except TypeError:
+            # This SDK version's runner takes no URL argument.
+            await runner()
     except Exception as exc:
         logger.error(f"[pocket_option] user={telegram_id}: stream error — {exc}")
         if auth_failed["flag"]:
