@@ -210,8 +210,8 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     SDK exception) is caught and logged — it only takes this one user's
     stream down, never the bot.
 
-    FIX: Passes auth directly to connect() instead of emitting it after
-    connection. This is the correct SDK usage pattern.
+    FIX: Passes auth as a DICTIONARY (model_dump()) to connect() instead
+    of the Pydantic model object, which isn't JSON serializable.
     """
     session = credentials.get("session") or credentials.get("PO_SESSION")
     uid     = credentials.get("uid") or credentials.get("PO_UID")
@@ -247,16 +247,17 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     auth_failed = {"flag": False}
     auth_completed = {"flag": False}
 
-    # Build the auth payload.
+    # Build the auth payload as a DICTIONARY (not the Pydantic model)
+    # The SDK's connect() expects auth as a dict, not a Pydantic model.
     try:
-        auth_data = AuthorizationData.model_validate({
+        auth_data = {
             "session": session,
             "isDemo": 1 if is_demo else 0,
             "uid": int(uid),
             "platform": 2,
             "isFastHistory": True,
             "isOptimized": True,
-        })
+        }
     except Exception as exc:
         logger.error(
             f"[pocket_option] user={telegram_id}: invalid credentials payload — {exc}"
@@ -319,18 +320,16 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     region = Regions.DEMO if is_demo else Regions.REAL
 
     try:
-        # ✅ FIX: Pass auth directly to connect() — this is the correct SDK pattern
-        # The SDK's connect() signature is:
-        #   connect(url, headers=None, auth=None, wait=True, wait_timeout=1, retry=False)
+        # ✅ FIX: Pass auth as a DICTIONARY (not the Pydantic model)
+        # The SDK's connect() signature expects a dict for auth.
         await client.connect(
             region,
-            auth=auth_data,  # <-- KEY FIX: auth goes here, not emitted after connect
+            auth=auth_data,  # <-- KEY FIX: auth_data is now a dict, not a Pydantic model
             wait=True,
             wait_timeout=float(os.getenv("PO_CONNECT_TIMEOUT", "20")),
         )
 
         # Wait a moment for auth to complete (success_auth or auth_error event)
-        # If auth completes quickly, we'll see it via the events.
         await asyncio.sleep(3)
 
         # If auth failed, the on_auth_error handler will have set the flag
