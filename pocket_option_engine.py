@@ -209,6 +209,9 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     data_engine.store_ohlc. Any failure here (bad session, network error,
     SDK exception) is caught and logged — it only takes this one user's
     stream down, never the bot.
+
+    FIX: Passes auth directly to connect() instead of emitting it after
+    connection. This is the correct SDK usage pattern.
     """
     session = credentials.get("session") or credentials.get("PO_SESSION")
     uid     = credentials.get("uid") or credentials.get("PO_UID")
@@ -242,14 +245,9 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     # Set by the auth-failure handler so the supervisor can tell an expired
     # session (don't retry blindly) apart from a transient network drop.
     auth_failed = {"flag": False}
+    auth_completed = {"flag": False}
 
-    # Build the auth payload up-front so the on-connect handler can emit it.
-    # Per the SDK source, BasePocketOptionClient.send() special-cases the
-    # "auth" event: it stores the credentials and serializes the pydantic
-    # model with model_dump(mode="json", by_alias=True). So auth MUST be
-    # EMITTED as an event after connect — passing auth=... into connect()
-    # only puts it in the Socket.IO CONNECT packet, which Pocket Option
-    # ignores (the socket opens but never authorizes, then times out).
+    # Build the auth payload.
     try:
         auth_data = AuthorizationData.model_validate({
             "session": session,
@@ -265,33 +263,25 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
         )
         return "auth_failed"
 
-    @client.on.connect
-    async def _on_connect(_data):
-        logger.info(f"[pocket_option] user={telegram_id}: socket connected, authorizing...")
-        try:
-            # The documented API (see the SDK README): client.emit.auth(...).
-            await client.emit.auth(auth_data)
-        except Exception as exc:
-            auth_failed["flag"] = True
-            logger.error(f"[pocket_option] user={telegram_id}: auth emit failed — {exc}")
+    # --- EVENT HANDLERS ---
 
-    # If the SDK exposes an auth-failure event, use it to flag expired
-    # sessions. Wrapped in try/except because event names vary by SDK version;
-    # a missing event simply means we fall back to backoff-based retries.
+    @client.on.success_auth
+    async def _on_success_auth(_data):
+        auth_completed["flag"] = True
+        logger.info(
+            f"[pocket_option] user={telegram_id}: ✅ AUTHORIZED "
+            f"({'DEMO' if is_demo else 'REAL'}) — subscribing {len(watch_assets)} assets"
+        )
+
+    # If the SDK exposes an auth-failure event, use it to flag expired sessions.
     try:
         @client.on.auth_error
         async def _on_auth_error(_data):
             auth_failed["flag"] = True
-            logger.warning(f"[pocket_option] user={telegram_id}: authentication rejected (session likely expired).")
+            auth_completed["flag"] = True
+            logger.warning(f"[pocket_option] user={telegram_id}: ❌ auth rejected (session likely expired).")
     except Exception:
         pass
-
-    @client.on.success_auth
-    async def _on_success_auth(_data):
-        logger.info(
-            f"[pocket_option] user={telegram_id}: authorized "
-            f"({'DEMO' if is_demo else 'REAL'}) — subscribing {len(watch_assets)} assets"
-        )
 
     @client.on.update_close_value
     async def _on_update_close_value(data):
@@ -324,37 +314,40 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
                         f"failed for {code}/{tf} — {exc}"
                     )
 
-    # ---- Connect ----------------------------------------------------------
-    # The SDK's real signature is:
-    #   connect(url, headers=None, auth=None, wait=True, wait_timeout=1, retry=False)
-    # so the auth payload is passed straight into connect() (NOT emitted after
-    # the connect event), and browser-like headers are required — Pocket Option
-    # rejects plain server clients that don't send an Origin/User-Agent.
-    #
-    # PO_WS_URL is env-driven because Pocket Option runs several regional
-    # endpoints, and DEMO vs REAL are different hosts. Copy the exact URL from
-    # DevTools → Network → Socket → (the socket showing "updateStream" price
-    # frames) → Headers → Request URL, and set it in Railway.
-    # Connect using the SDK's OWN region constants (see the README):
-    #     await client.connect(Regions.DEMO)
-    # NOT a hand-copied browser URL. The SDK builds the full socket.io URL
-    # (path + query params) itself from the region; passing a raw wss:// URL
-    # produces a malformed endpoint that Pocket Option accepts but never
-    # authenticates against.
-    #
-    # PO_WS_URL is honoured only as an explicit override if you ever need one.
+    # ---- Connect with Auth Directly ---------------------------------------
+
     region = Regions.DEMO if is_demo else Regions.REAL
-    target = os.getenv("PO_WS_URL") or region
 
     try:
+        # ✅ FIX: Pass auth directly to connect() — this is the correct SDK pattern
+        # The SDK's connect() signature is:
+        #   connect(url, headers=None, auth=None, wait=True, wait_timeout=1, retry=False)
         await client.connect(
-            target,
+            region,
+            auth=auth_data,  # <-- KEY FIX: auth goes here, not emitted after connect
             wait=True,
             wait_timeout=float(os.getenv("PO_CONNECT_TIMEOUT", "20")),
         )
-        # connect() returns once the socket is up; wait() blocks until the
-        # stream closes, keeping this user's task alive while ticks flow in.
+
+        # Wait a moment for auth to complete (success_auth or auth_error event)
+        # If auth completes quickly, we'll see it via the events.
+        await asyncio.sleep(3)
+
+        # If auth failed, the on_auth_error handler will have set the flag
+        if auth_failed["flag"]:
+            logger.warning(f"[pocket_option] user={telegram_id}: auth failed — returning auth_failed")
+            return "auth_failed"
+
+        # If auth never completed (no event fired), log but continue
+        if not auth_completed["flag"]:
+            logger.warning(
+                f"[pocket_option] user={telegram_id}: auth event not received after 3s — "
+                "connection may still be establishing. Continuing..."
+            )
+
+        # Keep connection alive — wait() blocks until the stream closes
         await client.wait()
+
     except Exception as exc:
         logger.error(f"[pocket_option] user={telegram_id}: stream error — {exc}")
         if auth_failed["flag"]:
