@@ -244,20 +244,9 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
 
     @client.on.connect
     async def _on_connect(_data):
-        logger.info(f"[pocket_option] user={telegram_id}: socket connected, authorizing...")
-        try:
-            await client.emit.auth(
-                AuthorizationData.model_validate({
-                    "session": session,
-                    "isDemo": 1 if is_demo else 0,
-                    "uid": int(uid),
-                    "platform": 2,
-                    "isFastHistory": True,
-                    "isOptimized": True,
-                })
-            )
-        except Exception as exc:
-            logger.error(f"[pocket_option] user={telegram_id}: auth emit failed — {exc}")
+        # Auth is passed directly into client.connect(auth=...) for this SDK
+        # version, so nothing is emitted here — this is purely a log hook.
+        logger.info(f"[pocket_option] user={telegram_id}: socket connected.")
 
     # If the SDK exposes an auth-failure event, use it to flag expired
     # sessions. Wrapped in try/except because event names vary by SDK version;
@@ -308,30 +297,76 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
                         f"failed for {code}/{tf} — {exc}"
                     )
 
-    # The SDK's connect() requires the WebSocket URL as a positional argument.
-    # Pocket Option runs several regional endpoints, so this is env-driven:
-    # copy the exact URL from DevTools → Network → Socket → click the socket →
-    # Headers → Request URL, then set it as PO_WS_URL in Railway. The inner
-    # TypeError fallback covers SDK versions whose runner takes no argument.
+    # ---- Connect ----------------------------------------------------------
+    # The SDK's real signature is:
+    #   connect(url, headers=None, auth=None, wait=True, wait_timeout=1, retry=False)
+    # so the auth payload is passed straight into connect() (NOT emitted after
+    # the connect event), and browser-like headers are required — Pocket Option
+    # rejects plain server clients that don't send an Origin/User-Agent.
+    #
+    # PO_WS_URL is env-driven because Pocket Option runs several regional
+    # endpoints, and DEMO vs REAL are different hosts. Copy the exact URL from
+    # DevTools → Network → Socket → (the socket showing "updateStream" price
+    # frames) → Headers → Request URL, and set it in Railway.
     PO_WS_URL = os.getenv(
         "PO_WS_URL",
-        "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+        "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
     )
 
+    po_headers = {
+        "Origin": os.getenv("PO_ORIGIN", "https://pocketoption.com"),
+        "User-Agent": os.getenv(
+            "PO_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ),
+    }
+
     try:
-        runner = getattr(client, "run", None) or getattr(client, "connect", None)
-        if runner is None:
-            raise RuntimeError("pocket_option client has neither .run() nor .connect()")
-        try:
-            await runner(PO_WS_URL)
-        except TypeError:
-            # This SDK version's runner takes no URL argument.
-            await runner()
+        auth_data = AuthorizationData.model_validate({
+            "session": session,
+            "isDemo": 1 if is_demo else 0,
+            "uid": int(uid),
+            "platform": 2,
+            "isFastHistory": True,
+            "isOptimized": True,
+        })
+    except Exception as exc:
+        logger.error(
+            f"[pocket_option] user={telegram_id}: invalid credentials payload — {exc}"
+        )
+        return "auth_failed"
+
+    try:
+        await client.connect(
+            PO_WS_URL,
+            headers=po_headers,
+            auth=auth_data,
+            wait=True,
+            wait_timeout=float(os.getenv("PO_CONNECT_TIMEOUT", "20")),
+        )
+        # connect() returns once the socket is up; wait() blocks until the
+        # stream closes, keeping this user's task alive while ticks flow in.
+        await client.wait()
     except Exception as exc:
         logger.error(f"[pocket_option] user={telegram_id}: stream error — {exc}")
         if auth_failed["flag"]:
             return "auth_failed"
         return "error"
+    finally:
+        # Always tear the client down. Without this the aiohttp session and
+        # TCP connector leak on every reconnect ("Unclosed client session"),
+        # which slowly exhausts the container over many retries.
+        for closer in ("shutdown", "disconnect"):
+            fn = getattr(client, closer, None)
+            if fn is None:
+                continue
+            try:
+                res = fn()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
 
     # Clean exit (socket closed without exception). Treat expired-auth as such.
     return "auth_failed" if auth_failed["flag"] else "closed"
