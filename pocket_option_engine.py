@@ -242,11 +242,38 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     # session (don't retry blindly) apart from a transient network drop.
     auth_failed = {"flag": False}
 
+    # Build the auth payload up-front so the on-connect handler can emit it.
+    # Per the SDK source, BasePocketOptionClient.send() special-cases the
+    # "auth" event: it stores the credentials and serializes the pydantic
+    # model with model_dump(mode="json", by_alias=True). So auth MUST be
+    # EMITTED as an event after connect — passing auth=... into connect()
+    # only puts it in the Socket.IO CONNECT packet, which Pocket Option
+    # ignores (the socket opens but never authorizes, then times out).
+    try:
+        auth_data = AuthorizationData.model_validate({
+            "session": session,
+            "isDemo": 1 if is_demo else 0,
+            "uid": int(uid),
+            "platform": 2,
+            "isFastHistory": True,
+            "isOptimized": True,
+        })
+    except Exception as exc:
+        logger.error(
+            f"[pocket_option] user={telegram_id}: invalid credentials payload — {exc}"
+        )
+        return "auth_failed"
+
     @client.on.connect
     async def _on_connect(_data):
-        # Auth is passed directly into client.connect(auth=...) for this SDK
-        # version, so nothing is emitted here — this is purely a log hook.
-        logger.info(f"[pocket_option] user={telegram_id}: socket connected.")
+        logger.info(f"[pocket_option] user={telegram_id}: socket connected, authorizing...")
+        try:
+            # client.send("auth", ...) -> sio.emit("auth", <serialized>).
+            # This is the path the SDK actually supports (see send() above).
+            await client.send("auth", auth_data)
+        except Exception as exc:
+            auth_failed["flag"] = True
+            logger.error(f"[pocket_option] user={telegram_id}: auth emit failed — {exc}")
 
     # If the SDK exposes an auth-failure event, use it to flag expired
     # sessions. Wrapped in try/except because event names vary by SDK version;
@@ -313,35 +340,12 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
         "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
     )
 
-    po_headers = {
-        "Origin": os.getenv("PO_ORIGIN", "https://pocketoption.com"),
-        "User-Agent": os.getenv(
-            "PO_USER_AGENT",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ),
-    }
-
-    try:
-        auth_data = AuthorizationData.model_validate({
-            "session": session,
-            "isDemo": 1 if is_demo else 0,
-            "uid": int(uid),
-            "platform": 2,
-            "isFastHistory": True,
-            "isOptimized": True,
-        })
-    except Exception as exc:
-        logger.error(
-            f"[pocket_option] user={telegram_id}: invalid credentials payload — {exc}"
-        )
-        return "auth_failed"
-
+    # NOTE: the SDK's connect() already applies its own DEFAULT_ORIGIN and
+    # DEFAULT_USER_AGENT via headers.setdefault(), so we pass none here and
+    # let it use the values it ships with.
     try:
         await client.connect(
             PO_WS_URL,
-            headers=po_headers,
-            auth=auth_data.model_dump(by_alias=True),
             wait=True,
             wait_timeout=float(os.getenv("PO_CONNECT_TIMEOUT", "20")),
         )
