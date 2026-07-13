@@ -223,6 +223,7 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     try:
         from pocket_option import PocketOptionClient
         from pocket_option.models import AuthorizationData
+        from pocket_option.constants import Regions
     except ImportError:
         logger.warning(
             "[pocket_option] `pocket-option` package not installed "
@@ -268,9 +269,8 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     async def _on_connect(_data):
         logger.info(f"[pocket_option] user={telegram_id}: socket connected, authorizing...")
         try:
-            # client.send("auth", ...) -> sio.emit("auth", <serialized>).
-            # This is the path the SDK actually supports (see send() above).
-            await client.send("auth", auth_data)
+            # The documented API (see the SDK README): client.emit.auth(...).
+            await client.emit.auth(auth_data)
         except Exception as exc:
             auth_failed["flag"] = True
             logger.error(f"[pocket_option] user={telegram_id}: auth emit failed — {exc}")
@@ -335,17 +335,20 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     # endpoints, and DEMO vs REAL are different hosts. Copy the exact URL from
     # DevTools → Network → Socket → (the socket showing "updateStream" price
     # frames) → Headers → Request URL, and set it in Railway.
-    PO_WS_URL = os.getenv(
-        "PO_WS_URL",
-        "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
-    )
+    # Connect using the SDK's OWN region constants (see the README):
+    #     await client.connect(Regions.DEMO)
+    # NOT a hand-copied browser URL. The SDK builds the full socket.io URL
+    # (path + query params) itself from the region; passing a raw wss:// URL
+    # produces a malformed endpoint that Pocket Option accepts but never
+    # authenticates against.
+    #
+    # PO_WS_URL is honoured only as an explicit override if you ever need one.
+    region = Regions.DEMO if is_demo else Regions.REAL
+    target = os.getenv("PO_WS_URL") or region
 
-    # NOTE: the SDK's connect() already applies its own DEFAULT_ORIGIN and
-    # DEFAULT_USER_AGENT via headers.setdefault(), so we pass none here and
-    # let it use the values it ships with.
     try:
         await client.connect(
-            PO_WS_URL,
+            target,
             wait=True,
             wait_timeout=float(os.getenv("PO_CONNECT_TIMEOUT", "20")),
         )
