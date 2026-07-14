@@ -210,8 +210,9 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     SDK exception) is caught and logged — it only takes this one user's
     stream down, never the bot.
 
-    FIX: Passes auth as a DICTIONARY (model_dump()) to connect() instead
-    of the Pydantic model object, which isn't JSON serializable.
+    FIX: Uses emit.auth() with the correct field names that Pocket Option
+    expects: "sessionToken" (not "session") and "uid" as a string.
+    This matches the exact WebSocket auth message from the browser.
     """
     session = credentials.get("session") or credentials.get("PO_SESSION")
     uid     = credentials.get("uid") or credentials.get("PO_UID")
@@ -225,7 +226,6 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
 
     try:
         from pocket_option import PocketOptionClient
-        from pocket_option.models import AuthorizationData
         from pocket_option.constants import Regions
     except ImportError:
         logger.warning(
@@ -247,16 +247,17 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
     auth_failed = {"flag": False}
     auth_completed = {"flag": False}
 
-    # Build the auth payload as a DICTIONARY (not the Pydantic model)
-    # The SDK's connect() expects auth as a dict, not a Pydantic model.
+    # Build the auth payload matching Pocket Option's WebSocket format.
+    # From browser DevTools: 42["auth", {sessionToken: "...", uid: "...", ...}]
     try:
         auth_data = {
-            "session": session,
+            "sessionToken": session,      # <-- FIX: "sessionToken" not "session"
+            "uid": str(uid),              # <-- FIX: uid as a string
             "isDemo": 1 if is_demo else 0,
-            "uid": int(uid),
             "platform": 2,
             "isFastHistory": True,
             "isOptimized": True,
+            "lang": "en",                 # Matches browser WebSocket payload
         }
     except Exception as exc:
         logger.error(
@@ -265,6 +266,16 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
         return "auth_failed"
 
     # --- EVENT HANDLERS ---
+
+    @client.on.connect
+    async def _on_connect(_data):
+        logger.info(f"[pocket_option] user={telegram_id}: socket connected, authorizing...")
+        try:
+            # Emit auth using the dictionary payload matching Pocket Option's format
+            await client.emit.auth(auth_data)
+        except Exception as exc:
+            auth_failed["flag"] = True
+            logger.error(f"[pocket_option] user={telegram_id}: auth emit failed — {exc}")
 
     @client.on.success_auth
     async def _on_success_auth(_data):
@@ -315,33 +326,34 @@ async def _run_user_stream(telegram_id: str, credentials: dict, is_demo: bool,
                         f"failed for {code}/{tf} — {exc}"
                     )
 
-    # ---- Connect with Auth Directly ---------------------------------------
-
+    # ---- Connect ----------------------------------------------------------
+    # IMPORTANT: The SDK's connect() method expects a REGION, NOT an auth payload.
+    # Auth is sent via emit.auth() after the connection is established.
     region = Regions.DEMO if is_demo else Regions.REAL
 
     try:
-        # ✅ FIX: Pass auth as a DICTIONARY (not the Pydantic model)
-        # The SDK's connect() signature expects a dict for auth.
+        # Connect using the region constant (no auth parameter here)
         await client.connect(
             region,
-            auth=auth_data,  # <-- KEY FIX: auth_data is now a dict, not a Pydantic model
             wait=True,
             wait_timeout=float(os.getenv("PO_CONNECT_TIMEOUT", "20")),
         )
 
-        # Wait a moment for auth to complete (success_auth or auth_error event)
-        await asyncio.sleep(3)
+        # Wait up to 10 seconds for auth to complete (success_auth or auth_error)
+        wait_start = time.time()
+        while not auth_completed["flag"] and (time.time() - wait_start) < 10:
+            await asyncio.sleep(0.5)
 
-        # If auth failed, the on_auth_error handler will have set the flag
+        # If auth failed, return auth_failed
         if auth_failed["flag"]:
             logger.warning(f"[pocket_option] user={telegram_id}: auth failed — returning auth_failed")
             return "auth_failed"
 
-        # If auth never completed (no event fired), log but continue
+        # If auth never completed after 10 seconds, log warning but keep trying
         if not auth_completed["flag"]:
             logger.warning(
-                f"[pocket_option] user={telegram_id}: auth event not received after 3s — "
-                "connection may still be establishing. Continuing..."
+                f"[pocket_option] user={telegram_id}: auth event not received after 10s — "
+                "connection may still be establishing. Will monitor..."
             )
 
         # Keep connection alive — wait() blocks until the stream closes
