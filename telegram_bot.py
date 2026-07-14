@@ -138,10 +138,7 @@ def _signal_times(signal, sent_at: datetime):
 
 
 def _format_timing_block(signal, sent_at: datetime) -> str:
-    """
-    Shows when signal was received, when to enter (candle close), 
-    and when it expires.
-    """
+    """The shared ENTRY TIME / EXPIRY TIME block used by every signal message."""
     entry_dt, expiry_dt, secs_left = _signal_times(signal, sent_at)
 
     entry_str  = _to_wat(entry_dt).strftime('%H:%M:%S')
@@ -159,15 +156,13 @@ def _format_timing_block(signal, sent_at: datetime) -> str:
         urgency = f"⚡ <b>ENTER IMMEDIATELY</b> — only ~{secs_left}s left"
 
     timing_lines = [
-        f"⏰ <b>Signal received:</b> {sent_str} WAT",
-        f"🎯 <b>ENTER at:</b>  <b>{entry_str} WAT</b> (candle close)",
-        f"⌛ <b>Expires at:</b> <b>{expiry_str} WAT</b>  ({signal.expiry_min} min)",
+        f"⏰ <b>Entry time:</b>  <b>{entry_str} WAT</b>",
+        f"⌛ <b>Expiry time:</b> <b>{expiry_str} WAT</b>  ({signal.expiry_min} min)",
         f"{urgency}"
     ]
     
-    # Show how long until entry if signal came early
-    if lag > 2 and secs_left > 0:
-        timing_lines.insert(2, f"⏱️ <b>Wait:</b> {lag}s until entry time")
+    if lag > 2:
+        timing_lines.insert(1, f"📨 <b>Signal sent:</b> {sent_str} WAT  (+{lag}s delay)")
     
     return "\n".join(timing_lines) + "\n"
 
