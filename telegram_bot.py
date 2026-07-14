@@ -52,17 +52,6 @@ _awaiting_amount: dict = {}  # chat_id → signal_key (user typing custom amount
 _awaiting_po_setup: dict = {}
 
 # Persistent reply keyboard shown at bottom of every chat.
-#
-# Grouped by purpose so every button is visible and nothing is buried:
-#   Row 1 — Info / monitoring
-#   Row 2 — Deriv platform (real market → VIP channel signals)
-#   Row 3 — Pocket Option platform (OTC → private DM signals)
-#   Row 4 — Settings / account
-#
-# NOTE: Telegram caches this keyboard client-side. It only refreshes when the
-# bot sends a message carrying `reply_markup`, so it is attached to several
-# commands below (/start, /help, /status, /myaccount) — not just /start. That
-# way a redeploy can never leave users stuck on a stale menu.
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
         [{"text": "📊 Pairs"},          {"text": "📈 Stats"},           {"text": "✅ Status"}],
@@ -136,19 +125,6 @@ def _edit_message(chat_id: str, message_id: int, text: str, parse_mode: str = "H
 # Signal formatters
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Entry / expiry timing
-#
-# The settlement worker scores a signal from `signal.timestamp + expiry_min`
-# (see settlement.log_pending), and `entry_price` is the price AT that
-# timestamp. So signal.timestamp IS the intended entry moment — the close of
-# the trigger candle, which is also the open of the candle you trade.
-#
-# That means the trader must enter as soon as the signal lands. Every second
-# of delay drifts them away from the entry_price the result is scored against,
-# so we show the entry time, the expiry time, and how long they have left.
-# ---------------------------------------------------------------------------
-
 def _signal_times(signal, sent_at: datetime):
     """Return (entry_dt, expiry_dt, seconds_left) — all UTC-aware."""
     entry_dt  = signal.timestamp
@@ -157,16 +133,12 @@ def _signal_times(signal, sent_at: datetime):
     expiry_dt = entry_dt + timedelta(minutes=signal.expiry_min)
     if sent_at.tzinfo is None:
         sent_at = sent_at.replace(tzinfo=timezone.utc)
-    # How long until this candle closes = the practical window to get in.
     secs_left = int((expiry_dt - sent_at).total_seconds())
     return entry_dt, expiry_dt, secs_left
 
 
 def _format_timing_block(signal, sent_at: datetime) -> str:
-    """
-    The shared ENTRY TIME / EXPIRY TIME block used by every signal message.
-    Shows actual times in WAT timezone with urgency indicator.
-    """
+    """The shared ENTRY TIME / EXPIRY TIME block used by every signal message."""
     entry_dt, expiry_dt, secs_left = _signal_times(signal, sent_at)
 
     entry_str  = _to_wat(entry_dt).strftime('%H:%M:%S')
@@ -176,7 +148,6 @@ def _format_timing_block(signal, sent_at: datetime) -> str:
     lag = int((sent_at.replace(tzinfo=timezone.utc)
                - entry_dt.replace(tzinfo=timezone.utc)).total_seconds())
 
-    # Build urgency message with clear warning if too late
     if secs_left <= 0:
         urgency = "⛔ <b>TOO LATE — do not enter this one</b>"
     elif lag <= 5:
@@ -184,14 +155,12 @@ def _format_timing_block(signal, sent_at: datetime) -> str:
     else:
         urgency = f"⚡ <b>ENTER IMMEDIATELY</b> — only ~{secs_left}s left"
 
-    # Build the timing block
     timing_lines = [
         f"⏰ <b>Entry time:</b>  <b>{entry_str} WAT</b>",
         f"⌛ <b>Expiry time:</b> <b>{expiry_str} WAT</b>  ({signal.expiry_min} min)",
         f"{urgency}"
     ]
     
-    # Add signal sent time with lag if significant
     if lag > 2:
         timing_lines.insert(1, f"📨 <b>Signal sent:</b> {sent_str} WAT  (+{lag}s delay)")
     
@@ -224,17 +193,7 @@ def _format_vip_message(signal, sent_at: datetime = None) -> str:
     label    = "CALL ↑ BUY" if is_call else "PUT ↓ SELL"
     action   = "📈 Price expected to RISE — place a CALL/BUY trade" if is_call \
                else "📉 Price expected to FALL — place a PUT/SELL trade"
-    r_icon   = "✅" if is_call else "🔻"
     sent_at  = sent_at or datetime.now(timezone.utc)
-
-    if signal.reasons:
-        reasons_html = "\n".join(f"  {r_icon} {r}" for r in signal.reasons)
-    else:
-        reasons_html = f"  {r_icon} Signal confirmed by market structure, indicators and AI"
-
-    warn_html = ""
-    if signal.warnings:
-        warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
 
     timing_block = _format_timing_block(signal, sent_at)
 
@@ -247,8 +206,7 @@ def _format_vip_message(signal, sent_at: datetime = None) -> str:
         f"💰 <b>Entry price:</b> <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>    {signal.session}\n\n"
-        f"{timing_block}"
-        f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
+        f"{timeling_block}"
         f"⚠️ <i>Risk disclaimer: Binary options carry significant financial risk. "
         f"Never trade with money you cannot afford to lose. Past performance does not guarantee future results.</i>"
     )
@@ -300,13 +258,7 @@ def _trade_keyboard(signal_key: str, amount: float, direction: str) -> dict:
 
 def send_prealert(asset: str, timeframe: str, direction: str,
                   confidence: float, seconds_left: int) -> dict:
-    """
-    Broadcast a provisional heads-up that a signal is likely forming on this
-    pair/timeframe, so users can get to their platform and set up before it
-    confirms at candle close. Pair + timing only — NOT the direction, which can
-    still change in the final seconds. The confirmed signal (with CALL/PUT)
-    follows when the candle closes.
-    """
+    """Broadcast a provisional heads-up that a signal is likely forming."""
     results = {}
     text = (
         f"⏰ <b>GET READY</b>\n\n"
@@ -340,16 +292,14 @@ def send_prealert(asset: str, timeframe: str, direction: str,
 
 def send_signal(signal) -> dict:
     results = {}
-    sent_at = datetime.now(timezone.utc)   # capture ACTUAL send time here
+    sent_at = datetime.now(timezone.utc)
 
-    # Build tasks — only for configured channels
     tasks = []
     if FREE_CHANNEL:
         tasks.append(("free", FREE_CHANNEL, _format_free_message(signal, sent_at)))
     if VIP_CHANNEL:
         tasks.append(("vip", VIP_CHANNEL, _format_vip_message(signal, sent_at)))
 
-    # Send free + VIP in parallel so neither waits on the other
     def _send_task(key, chat_id, text):
         results[key] = _send_message(chat_id, text)
 
@@ -360,9 +310,8 @@ def send_signal(signal) -> dict:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=12)   # max 12s — don't block the main scan loop forever
+        t.join(timeout=12)
 
-    # Admin prompt fires separately — non-critical, doesn't affect delivery time
     if ADMIN_CHAT_ID:
         threading.Thread(
             target=_send_trade_prompt,
@@ -375,17 +324,9 @@ def send_signal(signal) -> dict:
 
 # ---------------------------------------------------------------------------
 # OTC (Pocket Option) — PRIVATE per-user delivery
-#
-# OTC signals are intentionally NOT broadcast to the VIP / Free channels.
-# They are delivered privately, straight into the bot DM of each user who
-# has linked their own Pocket Option account via /connectpo, and only for
-# the assets that user subscribes to. Non-OTC signals keep going to the VIP
-# channel exactly as before (send_signal above is untouched).
 # ---------------------------------------------------------------------------
 
 def _otc_display_asset(asset: str) -> str:
-    """Turn an internal OTC storage code (e.g. 'EURUSD_otc') into a clean
-    display label (e.g. 'EURUSD OTC')."""
     base = asset.replace("_otc", "").replace("_OTC", "").rstrip("_")
     return f"{base} OTC"
 
@@ -396,17 +337,7 @@ def _format_otc_message(signal, sent_at: datetime = None) -> str:
     label   = "CALL ↑ BUY" if is_call else "PUT ↓ SELL"
     action  = "📈 Price expected to RISE — place a CALL/BUY trade" if is_call \
               else "📉 Price expected to FALL — place a PUT/SELL trade"
-    r_icon  = "✅" if is_call else "🔻"
     sent_at = sent_at or datetime.now(timezone.utc)
-
-    if signal.reasons:
-        reasons_html = "\n".join(f"  {r_icon} {r}" for r in signal.reasons)
-    else:
-        reasons_html = f"  {r_icon} Signal confirmed by market structure, indicators and AI"
-
-    warn_html = ""
-    if signal.warnings:
-        warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
 
     timing_block = _format_timing_block(signal, sent_at)
 
@@ -420,15 +351,12 @@ def _format_otc_message(signal, sent_at: datetime = None) -> str:
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>    {signal.session}\n"
         f"\n{timing_block}"
-        f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
         f"⚠️ <i>OTC markets are broker-generated. Binary options carry significant "
         f"financial risk. Never trade with money you cannot afford to lose.</i>"
     )
 
 
 def _otc_asset_matches(user_assets, signal_asset: str) -> bool:
-    """True if this OTC signal's asset is in the user's subscribed list.
-    An empty list means the user receives all OTC assets."""
     if not user_assets:
         return True
     target = signal_asset.upper().replace("_OTC", "").rstrip("_")
@@ -439,14 +367,6 @@ def _otc_asset_matches(user_assets, signal_asset: str) -> bool:
 
 
 def send_otc_signal(signal) -> dict:
-    """
-    Deliver an OTC (Pocket Option) signal PRIVATELY into the bot — one DM
-    per connected Pocket Option user, filtered to the assets they subscribe
-    to. This never posts to the VIP or Free channels.
-
-    Returns {telegram_id: bool} for each user a delivery was attempted for.
-    Safe to call when no users are connected (logs and returns empty).
-    """
     results: dict = {}
     sent_at = datetime.now(timezone.utc)
 
@@ -458,10 +378,7 @@ def send_otc_signal(signal) -> dict:
         return results
 
     if not po_users:
-        logger.info(
-            "send_otc_signal: no Pocket Option users connected — "
-            "OTC signal not delivered (nothing sent to VIP/Free, by design)."
-        )
+        logger.info("send_otc_signal: no Pocket Option users connected")
         return results
 
     text = _format_otc_message(signal, sent_at)
@@ -489,7 +406,6 @@ def send_otc_signal(signal) -> dict:
 
 
 def _send_trade_prompt(chat_id: str, signal):
-    """Send trade prompt with buttons to a subscriber."""
     try:
         from user_manager import get_subscriber
         sub = get_subscriber(chat_id)
@@ -520,7 +436,6 @@ def _send_trade_prompt(chat_id: str, signal):
 
 
 def send_trade_prompts_to_subscribers(signal):
-    """Send trade prompt to all connected subscribers."""
     try:
         from user_manager import get_all_connected
         for sub in get_all_connected():
@@ -550,7 +465,7 @@ def send_performance_report(report_text: str, report_type: str = "Daily"):
 
 
 # ---------------------------------------------------------------------------
-# Callback query handler (button taps)
+# Callback query handler
 # ---------------------------------------------------------------------------
 
 def _handle_callback(update: dict):
@@ -576,7 +491,6 @@ def _handle_callback(update: dict):
         _answer_callback(cb_id, "⏰ Signal expired", alert=True)
         return
 
-    # --- Amount adjustments ---
     if action == "amt_minus5":
         trade["amount"] = max(1, trade["amount"] - 5)
 
@@ -594,7 +508,6 @@ def _handle_callback(update: dict):
         return
 
     elif action == "amt_type":
-        # User wants to type custom amount
         _awaiting_amount[chat_id] = signal_key
         _answer_callback(cb_id)
         _send_message(chat_id,
@@ -666,7 +579,6 @@ def _handle_callback(update: dict):
             _answer_callback(cb_id, f"❌ Error: {exc}", alert=True)
         return
 
-    # Update message with new amount
     text     = _format_trade_message_from_dict(trade)
     keyboard = _trade_keyboard(signal_key, trade["amount"], trade["direction"])
     _edit_message(chat_id, msg_id, text, reply_markup=keyboard)
@@ -678,11 +590,6 @@ def _handle_callback(update: dict):
 # ---------------------------------------------------------------------------
 
 def _handle_po_setup_input(chat_id: str, text: str):
-    """
-    Small stateful conversation, mirroring the pattern already used for
-    /setamount and per-signal amount entry (_awaiting_amount). Collects
-    PO_SESSION, then PO_UID, then demo/real, then saves via UserManager.
-    """
     state = _awaiting_po_setup.get(chat_id)
     if not state:
         return
@@ -826,7 +733,6 @@ class BotCommandHandler:
         username = msg.get("from", {}).get("username", "unknown")
         logger.info(f"Command from @{username}: {text}")
 
-        # --- Check if user is typing a custom amount ---
         if chat_id in _awaiting_amount and not text.startswith("/"):
             try:
                 amount = float(text.replace("$", "").strip())
@@ -836,7 +742,6 @@ class BotCommandHandler:
 
                 signal_key = _awaiting_amount.pop(chat_id)
 
-                # Setting default amount via button
                 if signal_key == "__setamount__":
                     from user_manager import set_amount
                     set_amount(chat_id, amount)
@@ -846,7 +751,6 @@ class BotCommandHandler:
                     )
                     return
 
-                # Setting amount for a pending trade
                 trade = _pending_trades.get(signal_key)
                 if not trade:
                     _send_message(chat_id, "⏰ Signal expired. Wait for the next signal.")
@@ -865,16 +769,10 @@ class BotCommandHandler:
                 )
                 return
 
-        # --- Check if user is mid-flow entering Pocket Option credentials ---
         if chat_id in _awaiting_po_setup and not text.startswith("/"):
             _handle_po_setup_input(chat_id, text)
             return
 
-        # Map button texts to commands.
-        # IMPORTANT: "🎯 Connect OTC" and "🔌 Disconnect OTC" map to
-        # /connectpo and /disconnectpo, which are matched BEFORE the plain
-        # /connect and /disconnect branches below (startswith would otherwise
-        # let "/connect" swallow "/connectpo").
         button_map = {
             "📊 Pairs":           "/pairs",
             "📈 Stats":           "/stats",
@@ -887,16 +785,12 @@ class BotCommandHandler:
             "💵 Set Amount":      "/setamount",
             "👤 My Account":      "/myaccount",
             "📖 Help":            "/help",
-            # Back-compat with the old menu labels, so users whose Telegram
-            # still shows the previous cached keyboard don't hit "Unknown
-            # command" before it refreshes.
             "🔗 Connect":         "/connect",
             "🎯 Pocket Option":   "/connectpo",
         }
         if text in button_map:
             text = button_map[text]
 
-        # --- Commands ---
         if text.startswith("/start"):
             first_name = msg.get("from", {}).get("first_name", "")
             try:
@@ -919,9 +813,6 @@ class BotCommandHandler:
                 reply_markup=MAIN_MENU_KEYBOARD
             )
 
-        # NOTE: /connectpo and /disconnectpo are checked BEFORE the plain
-        # /connect and /disconnect branches below, since str.startswith
-        # would otherwise let "/connect" swallow "/connectpo" first.
         elif text.startswith("/connectpo"):
             _awaiting_po_setup[chat_id] = {"stage": "session"}
             _send_message(chat_id,
