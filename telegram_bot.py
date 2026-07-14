@@ -206,7 +206,7 @@ def _format_vip_message(signal, sent_at: datetime = None) -> str:
         f"💰 <b>Entry price:</b> <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>    {signal.session}\n\n"
-        f"{timeling_block}"
+        f"{timing_block}"
         f"⚠️ <i>Risk disclaimer: Binary options carry significant financial risk. "
         f"Never trade with money you cannot afford to lose. Past performance does not guarantee future results.</i>"
     )
