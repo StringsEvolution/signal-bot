@@ -136,6 +136,68 @@ def _edit_message(chat_id: str, message_id: int, text: str, parse_mode: str = "H
 # Signal formatters
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Entry / expiry timing
+#
+# The settlement worker scores a signal from `signal.timestamp + expiry_min`
+# (see settlement.log_pending), and `entry_price` is the price AT that
+# timestamp. So signal.timestamp IS the intended entry moment — the close of
+# the trigger candle, which is also the open of the candle you trade.
+#
+# That means the trader must enter as soon as the signal lands. Every second
+# of delay drifts them away from the entry_price the result is scored against,
+# so we show the entry time, the expiry time, and how long they have left.
+# ---------------------------------------------------------------------------
+
+def _signal_times(signal, sent_at: datetime):
+    """Return (entry_dt, expiry_dt, seconds_left) — all UTC-aware."""
+    entry_dt  = signal.timestamp
+    if entry_dt.tzinfo is None:
+        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+    expiry_dt = entry_dt + timedelta(minutes=signal.expiry_min)
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    # How long until this candle closes = the practical window to get in.
+    secs_left = int((expiry_dt - sent_at).total_seconds())
+    return entry_dt, expiry_dt, secs_left
+
+
+def _format_timing_block(signal, sent_at: datetime) -> str:
+    """
+    The shared ENTRY TIME / EXPIRY TIME block used by every signal message.
+    Shows actual times in WAT timezone with urgency indicator.
+    """
+    entry_dt, expiry_dt, secs_left = _signal_times(signal, sent_at)
+
+    entry_str  = _to_wat(entry_dt).strftime('%H:%M:%S')
+    expiry_str = _to_wat(expiry_dt).strftime('%H:%M:%S')
+    sent_str   = _to_wat(sent_at).strftime('%H:%M:%S')
+
+    lag = int((sent_at.replace(tzinfo=timezone.utc)
+               - entry_dt.replace(tzinfo=timezone.utc)).total_seconds())
+
+    # Build urgency message with clear warning if too late
+    if secs_left <= 0:
+        urgency = "⛔ <b>TOO LATE — do not enter this one</b>"
+    elif lag <= 5:
+        urgency = f"🚀 <b>ENTER NOW</b> — about {secs_left}s left"
+    else:
+        urgency = f"⚡ <b>ENTER IMMEDIATELY</b> — only ~{secs_left}s left"
+
+    # Build the timing block
+    timing_lines = [
+        f"⏰ <b>Entry time:</b>  <b>{entry_str} WAT</b>",
+        f"⌛ <b>Expiry time:</b> <b>{expiry_str} WAT</b>  ({signal.expiry_min} min)",
+        f"{urgency}"
+    ]
+    
+    # Add signal sent time with lag if significant
+    if lag > 2:
+        timing_lines.insert(1, f"📨 <b>Signal sent:</b> {sent_str} WAT  (+{lag}s delay)")
+    
+    return "\n".join(timing_lines) + "\n"
+
+
 def _format_free_message(signal, sent_at: datetime = None) -> str:
     is_call  = signal.direction == "CALL"
     icon     = "🟢" if is_call else "🔴"
@@ -143,23 +205,15 @@ def _format_free_message(signal, sent_at: datetime = None) -> str:
     action   = "Price expected to RISE" if is_call else "Price expected to FALL"
     sent_at  = sent_at or datetime.now(timezone.utc)
 
-    # Show sent time (when you actually receive it) + candle time (what triggered it)
-    sent_wat   = _to_wat(sent_at).strftime('%H:%M WAT')
-    candle_wat = _to_wat(signal.timestamp).strftime('%H:%M WAT')
-    time_line  = (
-        f"🕒 Sent: <b>{sent_wat}</b>  |  📊 Candle: {candle_wat}"
-        if sent_wat != candle_wat
-        else f"🕒 Time: <b>{sent_wat}</b>"
-    )
+    timing_block = _format_timing_block(signal, sent_at)
 
     return (
         f"🔔 <b>New Signal</b>\n\n"
         f"{icon} <b>{label}</b> — {signal.asset}\n"
         f"📈 {action}\n"
-        f"⏳ Expiry: {signal.expiry_min} min\n"
         f"🤖 Confidence: <b>{signal.confidence:.0f}%</b>\n"
-        f"{time_line}\n\n"
-        f"📊 Full analysis available in VIP 👇\n"
+        f"{timing_block}"
+        f"\n📊 Full analysis available in VIP 👇\n"
         f"🔒 Join: {os.getenv('VIP_INVITE_LINK', 't.me/your_vip_link')}"
     )
 
@@ -182,12 +236,7 @@ def _format_vip_message(signal, sent_at: datetime = None) -> str:
     if signal.warnings:
         warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
 
-    # sent_at = actual delivery time (what trader should act on)
-    # signal.timestamp = candle close that triggered the signal
-    sent_str   = _to_wat(sent_at).strftime('%Y-%m-%d %H:%M:%S')
-    candle_str = _to_wat(signal.timestamp).strftime('%H:%M:%S')
-    lag_sec    = int((sent_at.replace(tzinfo=timezone.utc) - signal.timestamp.replace(tzinfo=timezone.utc)).total_seconds())
-    lag_note   = f" (+{lag_sec}s delivery)" if lag_sec > 2 else ""
+    timing_block = _format_timing_block(signal, sent_at)
 
     return (
         f"{'⭐' if is_call else '🔥'} <b>VIP Signal</b> — {icon} {label}\n\n"
@@ -195,11 +244,10 @@ def _format_vip_message(signal, sent_at: datetime = None) -> str:
         f"📊 <b>Pair:</b>       {signal.asset}\n"
         f"📈 <b>Timeframe:</b>  {signal.timeframe}\n"
         f"⏳ <b>Expiry:</b>     {signal.expiry_min} minutes\n"
-        f"💰 <b>Entry:</b>      <code>{signal.entry_price:.5f}</code>\n"
+        f"💰 <b>Entry price:</b> <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
-        f"🌍 <b>Session:</b>    {signal.session}\n"
-        f"🕒 <b>Sent (WAT):</b> <b>{sent_str}</b>{lag_note}\n"
-        f"📊 <b>Candle time:</b> {candle_str} WAT\n\n"
+        f"🌍 <b>Session:</b>    {signal.session}\n\n"
+        f"{timing_block}"
         f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
         f"⚠️ <i>Risk disclaimer: Binary options carry significant financial risk. "
         f"Never trade with money you cannot afford to lose. Past performance does not guarantee future results.</i>"
@@ -360,10 +408,7 @@ def _format_otc_message(signal, sent_at: datetime = None) -> str:
     if signal.warnings:
         warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
 
-    sent_str   = _to_wat(sent_at).strftime('%Y-%m-%d %H:%M:%S')
-    candle_str = _to_wat(signal.timestamp).strftime('%H:%M:%S')
-    lag_sec    = int((sent_at.replace(tzinfo=timezone.utc) - signal.timestamp.replace(tzinfo=timezone.utc)).total_seconds())
-    lag_note   = f" (+{lag_sec}s delivery)" if lag_sec > 2 else ""
+    timing_block = _format_timing_block(signal, sent_at)
 
     return (
         f"🎯 <b>OTC Signal</b> (Pocket Option) — {icon} {label}\n\n"
@@ -371,11 +416,10 @@ def _format_otc_message(signal, sent_at: datetime = None) -> str:
         f"📊 <b>Pair:</b>       {_otc_display_asset(signal.asset)}\n"
         f"📈 <b>Timeframe:</b>  {signal.timeframe}\n"
         f"⏳ <b>Expiry:</b>     {signal.expiry_min} minutes\n"
-        f"💰 <b>Entry:</b>      <code>{signal.entry_price:.5f}</code>\n"
+        f"💰 <b>Entry price:</b> <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>    {signal.session}\n"
-        f"🕒 <b>Sent (WAT):</b> <b>{sent_str}</b>{lag_note}\n"
-        f"📊 <b>Candle time:</b> {candle_str} WAT\n\n"
+        f"\n{timing_block}"
         f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
         f"⚠️ <i>OTC markets are broker-generated. Binary options carry significant "
         f"financial risk. Never trade with money you cannot afford to lose.</i>"
