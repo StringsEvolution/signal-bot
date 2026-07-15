@@ -349,9 +349,20 @@ def analyse_structure(df: pd.DataFrame) -> StructureResult:
 # ---------------------------------------------------------------------------
 
 def _ema(series: np.ndarray, period: int) -> np.ndarray:
+    n = len(series)
     result = np.zeros_like(series, dtype=float)
-    k      = 2 / (period + 1)
-    result[period - 1] = np.mean(series[:period])
-    for i in range(period, len(series)):
+    if n == 0:
+        return result
+    k = 2 / (period + 1)
+    # Warmup index is normally period-1. But OTC / live streams may hand us
+    # FEWER than `period` candles (e.g. 86 rows with an EMA200 request), which
+    # made `result[period-1]` an out-of-bounds write and crashed the handler.
+    # Clamp the seed to the last available index and seed with the SMA of
+    # whatever history we have. When n >= period this is byte-for-byte the old
+    # behaviour; when n < period, EMA(period) degrades gracefully to "mean of
+    # available closes", which is a sensible approximation for the trend gate.
+    seed_idx = min(period, n) - 1
+    result[seed_idx] = np.mean(series[:seed_idx + 1])
+    for i in range(seed_idx + 1, n):
         result[i] = series[i] * k + result[i - 1] * (1 - k)
     return result
