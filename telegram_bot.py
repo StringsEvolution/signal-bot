@@ -287,8 +287,7 @@ def _trade_keyboard(signal_key: str, amount: float, direction: str) -> dict:
 #     for t in threads:
 #         t.join(timeout=8)
 # 
-#     return results 
-
+#     return results
 
 
 def send_signal(signal) -> dict:
