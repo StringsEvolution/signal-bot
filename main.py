@@ -180,6 +180,17 @@ def run_live_bot():
     except Exception as exc:
         logger.warning(f"Pocket Option engine could not be started: {exc}")
 
+    # IQ Option OTC engine. Reuses _on_po_candle: IQ candles are stored under
+    # the SAME internal `_otc` codes and flow through the identical
+    # _handle_po_candle_close -> send_otc_signal path, so OTC signals from IQ
+    # are delivered privately per-user exactly like Pocket Option's.
+    iq_engine_thread = None
+    try:
+        from iq_option_engine import start_iq_option_engine
+        iq_engine_thread = start_iq_option_engine(on_candle=_on_po_candle)
+    except Exception as exc:
+        logger.warning(f"IQ Option engine could not be started: {exc}")
+
     # ----------------------------------------------------------------
     # Fires the instant a candle closes for one asset/timeframe.
     # Runs in a worker thread — never blocks the live WS connections.
