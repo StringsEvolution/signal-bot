@@ -125,13 +125,18 @@ def get_engine():
             "DATABASE_URL",
             "postgresql://postgres:password@localhost:5432/signal_bot"
         )
+        # pool_recycle raised 300s -> 1800s: fewer forced reconnects means
+        # fewer TLS handshakes, which on managed Postgres (Neon) count toward
+        # the data-transfer quota. pool_pre_ping stays on for resilience but
+        # can be disabled with DB_PRE_PING=0 if you need to shave every byte.
+        pre_ping = os.getenv("DB_PRE_PING", "1") != "0"
         _engine = create_engine(
             db_url,
-            pool_pre_ping=True,
+            pool_pre_ping=pre_ping,
             pool_size=5,
             max_overflow=5,
             pool_timeout=10,
-            pool_recycle=300,
+            pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             connect_args={
                 "connect_timeout": 10,
             },
@@ -148,8 +153,73 @@ def get_engine():
         return _engine
 
 
+class DBUnavailable(Exception):
+    """Raised when the database cannot be reached after retries.
+
+    This is deliberately distinct from a transient/programming error so the
+    caller (main.py) can decide to back off *inside the same process* instead
+    of letting the process die and be restart-stormed by the platform. When
+    the DB is down for a hard reason (e.g. Neon/Postgres transfer-quota
+    exceeded), a tight restart loop hammers the provider and burns even more
+    quota — the opposite of what we want.
+    """
+
+
+def wait_for_db(max_attempts: int = 6, base_delay: float = 2.0,
+                max_delay: float = 60.0) -> bool:
+    """Try to open a DB connection, retrying with exponential backoff.
+
+    Returns True on success. Raises DBUnavailable if all attempts fail.
+    Quota-exhaustion errors are detected and surfaced clearly so the operator
+    knows the fix is 'upgrade / reduce transfer', not 'restart the bot'.
+    """
+    engine = get_engine()
+    delay = base_delay
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            if attempt > 1:
+                logger.info("Database reachable after %d attempt(s).", attempt)
+            return True
+        except Exception as exc:  # noqa: BLE001 - we re-classify below
+            last_err = exc
+            msg = str(exc).lower()
+            is_quota = ("data transfer quota" in msg or "exceeded" in msg
+                        and "quota" in msg)
+            # Dispose so we don't keep a poisoned/half-open pool around.
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+            if is_quota:
+                logger.error(
+                    "DB rejected connection due to a PROVIDER QUOTA limit "
+                    "(attempt %d/%d): %s",
+                    attempt, max_attempts, exc,
+                )
+            else:
+                logger.warning(
+                    "DB not ready (attempt %d/%d): %s",
+                    attempt, max_attempts, exc,
+                )
+            if attempt < max_attempts:
+                logger.info("Retrying DB connection in %.0fs...", delay)
+                time.sleep(delay)
+                delay = min(delay * 2, max_delay)
+    raise DBUnavailable(
+        f"Database unreachable after {max_attempts} attempts. "
+        f"Last error: {last_err}"
+    )
+
+
 def init_db():
     engine = get_engine()
+    # Gate: don't run DDL until the DB actually answers. Raises DBUnavailable
+    # (caught in main) instead of letting a raw OperationalError kill the
+    # process and trigger a platform restart storm.
+    wait_for_db()
     ddl = """
     CREATE TABLE IF NOT EXISTS ohlc_data (
         id          SERIAL PRIMARY KEY,
