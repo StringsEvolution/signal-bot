@@ -236,19 +236,15 @@ def _format_vip_message(signal, sent_at: datetime = None) -> str:
     label    = "CALL ↑ BUY" if is_call else "PUT ↓ SELL"
     action   = "📈 Price expected to RISE — place a CALL/BUY trade" if is_call \
                else "📉 Price expected to FALL — place a PUT/SELL trade"
-    r_icon   = "✅" if is_call else "🔻"
     sent_at  = sent_at or datetime.now(timezone.utc)
 
-    if signal.reasons:
-        reasons_html = "\n".join(f"  {r_icon} {r}" for r in signal.reasons)
+    entry_dt, expiry_dt, secs_left = _signal_times(signal, sent_at)
+    entry_str  = _wat_12h(entry_dt)
+    expiry_str = _wat_12h(expiry_dt)
+    if secs_left <= 0:
+        when = "⛔ <b>TOO LATE — do not enter this one</b>"
     else:
-        reasons_html = f"  {r_icon} Signal confirmed by market structure, indicators and AI"
-
-    warn_html = ""
-    if signal.warnings:
-        warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
-
-    timing_block = _format_timing_block(signal, sent_at)
+        when = f"🚀 <b>ENTER NOW</b> — about {secs_left}s left"
 
     return (
         f"{'⭐' if is_call else '🔥'} <b>VIP Signal</b> — {icon} {label}\n\n"
@@ -259,8 +255,9 @@ def _format_vip_message(signal, sent_at: datetime = None) -> str:
         f"💰 <b>Entry price:</b> <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>    {signal.session}\n\n"
-        f"{timing_block}\n"
-        f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
+        f"⏰ <b>Entry time:</b> <b>{entry_str} WAT</b>\n"
+        f"⌛ <b>Expiry time:</b> <b>{expiry_str} WAT</b>  ({signal.expiry_min} min)\n"
+        f"{when}\n\n"
         f"⚠️ <i>Risk disclaimer: Binary options carry significant financial risk. "
         f"Never trade with money you cannot afford to lose. Past performance does not guarantee future results.</i>"
     )
@@ -411,11 +408,6 @@ def _format_otc_message(signal, sent_at: datetime = None) -> str:
     r_icon  = "✅" if is_call else "🔻"
     sent_at = sent_at or datetime.now(timezone.utc)
 
-    if signal.reasons:
-        reasons_html = "\n".join(f"  {r_icon} {r}" for r in signal.reasons)
-    else:
-        reasons_html = f"  {r_icon} Signal confirmed by market structure, indicators and AI"
-
     warn_html = ""
     if signal.warnings:
         warn_html = "\n⚠️ <b>Warnings:</b>\n" + "\n".join(f"  ⚠️ {w}" for w in signal.warnings)
@@ -431,8 +423,8 @@ def _format_otc_message(signal, sent_at: datetime = None) -> str:
         f"💰 <b>Entry price:</b> <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>    {signal.session}\n"
-        f"\n{timing_block}\n"
-        f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
+        f"\n{timing_block}"
+        f"{warn_html}\n\n"
         f"⚠️ <i>OTC markets are broker-generated. Binary options carry significant "
         f"financial risk. Never trade with money you cannot afford to lose.</i>"
     )
