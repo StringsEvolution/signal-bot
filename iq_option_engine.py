@@ -49,6 +49,19 @@ PLATFORM = "iq_option"
 TF_MINUTES = {"M1": 1, "M2": 2, "M3": 3, "M5": 5, "M15": 15}
 TF_SECONDS = {tf: m * 60 for tf, m in TF_MINUTES.items()}
 
+# IQ Option's candle API only accepts a FIXED set of durations (in seconds).
+# 180s (M3) is NOT one of them, so calling start_candles_stream / 
+# get_realtime_candles with 180 makes the library log
+#   **error** get_realtime_candles() please input right "size"
+# on EVERY poll for EVERY asset — the once-per-second log flood. We filter to
+# supported sizes at stream-start below, so M3 is simply skipped on IQ's native
+# feed. (M3 still streams fine on the Deriv pipeline / VIP channel; it's only
+# IQ Option that can't provide a native 3-minute candle.)
+IQ_VALID_SIZES = {
+    1, 5, 10, 15, 30, 60, 120, 300, 600, 900,
+    1800, 3600, 7200, 14400, 28800, 43200, 86400, 604800, 2592000,
+}
+
 # Default OTC watchlist if a user hasn't set their own IQ_ASSETS. IQ uses
 # hyphenated uppercase OTC names; _iq_asset_code() converts to internal codes.
 DEFAULT_IQ_ASSETS = [
@@ -206,6 +219,16 @@ def _run_user_stream(telegram_id, credentials: dict, is_demo: bool,
     started = []
     for sym in symbols:
         for tf, secs in TF_SECONDS.items():
+            if secs not in IQ_VALID_SIZES:
+                # e.g. M3 (180s). Logged ONCE per (sym, tf) here instead of
+                # flooding the log on every realtime poll. Skipping means this
+                # (sym, tf) is never added to `started`, so the poll loop below
+                # never requests it.
+                logger.info(
+                    f"[iq_option] user={telegram_id}: skipping {sym}/{tf} "
+                    f"({secs}s) — not an IQ-supported candle size."
+                )
+                continue
             try:
                 Iq.start_candles_stream(sym, secs, MAXDICT)
                 started.append((sym, tf, secs))
