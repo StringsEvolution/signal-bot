@@ -62,6 +62,7 @@ def run_live_bot():
     from data_engine   import (
         init_db, refresh_all, get_key_manager, store_ohlc,
         run_streaming_engine, ASSETS, TIMEFRAMES, TF_MINUTES,
+        DBUnavailable,
     )
     from signal_engine import generate_signal
     from telegram_bot  import send_signal, send_otc_signal, send_admin_alert, BotCommandHandler
@@ -73,7 +74,39 @@ def run_live_bot():
     logger.info("  Signal Bot Pro — Starting (real-time streaming mode)")
     logger.info("=" * 60)
 
-    init_db()
+    try:
+        init_db()
+    except DBUnavailable as exc:
+        # The DB is down for a hard reason (most commonly: Neon/Postgres
+        # transfer-quota exceeded). Crashing here just makes the platform
+        # restart us in ~2s, and every restart re-attempts the connection —
+        # which BURNS MORE of the very quota that's blocking us. So instead we
+        # hold the process alive and idle. No reconnect churn, no restart
+        # storm. Fix the quota (upgrade plan / reduce transfer / wait for
+        # monthly reset), then redeploy or restart once.
+        logger.critical("=" * 60)
+        logger.critical("STARTUP HALTED — database unreachable.")
+        logger.critical(str(exc))
+        logger.critical(
+            "If this is a Neon 'data transfer quota exceeded' error: the bot "
+            "will NOT auto-recover by restarting. Resolve the quota, then "
+            "restart this service once."
+        )
+        logger.critical("Holding idle to avoid a restart/reconnect storm...")
+        logger.critical("=" * 60)
+        try:
+            send_admin_alert(
+                "⛔ Signal Bot could not start: database unreachable "
+                "(likely Postgres transfer-quota exceeded). Holding idle. "
+                "Fix the DB quota, then restart the service."
+            )
+        except Exception:
+            pass
+        # Idle forever (until operator restarts). Sleep in a loop so signals
+        # like SIGTERM still terminate us cleanly on redeploy.
+        while True:
+            time.sleep(3600)
+
     from user_manager import init_user_tables, init_platform_tables
     init_user_tables()
     init_platform_tables()
