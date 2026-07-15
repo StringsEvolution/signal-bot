@@ -415,7 +415,7 @@ def _format_otc_message(signal, sent_at: datetime = None) -> str:
     timing_block = _format_timing_block(signal, sent_at)
 
     return (
-        f"🎯 <b>OTC Signal</b> (Pocket Option) — {icon} {label}\n\n"
+        f"🎯 <b>OTC Signal</b> (Iq Option) — {icon} {label}\n\n"
         f"{action}\n\n"
         f"📊 <b>Pair:</b>       {_otc_display_asset(signal.asset)}\n"
         f"📈 <b>Timeframe:</b>  {signal.timeframe}\n"
