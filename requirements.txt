@@ -15,3 +15,4 @@ matplotlib>=3.7.0
 websockets>=11.0
 cryptography>=42.0.0 
 pocket-option>=0.1.6
+iqoptionapi @ https://github.com/iqoptionapi/iqoptionapi/archive/refs/heads/master.zip 
