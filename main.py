@@ -86,9 +86,14 @@ def run_live_bot():
     # once its expiry elapses, so daily/weekly reports actually populate.
     settlement_worker.start()
 
-    # Start the pre-alert worker: heads-up a few seconds before a signal
-    # confirms, so users can set up on their platform in time.
-    prealert_worker.start()
+    # Pre-alert worker: heads-up a few seconds before a signal confirms.
+    # Disabled by default (it was causing channel noise). Re-enable any time
+    # by setting PREALERT_ENABLED=1 in the environment — no code change needed.
+    if os.getenv("PREALERT_ENABLED", "0") == "1":
+        prealert_worker.start()
+        logger.info("Pre-alert worker started (PREALERT_ENABLED=1).")
+    else:
+        logger.info("Pre-alert worker disabled (set PREALERT_ENABLED=1 to enable).")
 
     # ----------------------------------------------------------------
     # Startup seed — runs ONCE with the new parallel fetch (~8s).
