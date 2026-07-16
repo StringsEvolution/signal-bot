@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-ASSETS     = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "BTCUSD"]
+ASSETS     = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF"]
 TIMEFRAMES = ["M1", "M2", "M3", "M5", "M15"]
 
 TF_MINUTES = {"M1": 1,  "M2": 2,  "M3": 3,  "M5": 5,  "M15": 15}
@@ -32,9 +32,8 @@ TF_EXPIRY  = {"M1": 1,  "M2": 2,  "M3": 3,  "M5": 5,  "M15": 15}
 DERIV_SYMBOLS = {
     "EURUSD": "frxEURUSD",
     "GBPUSD": "frxGBPUSD",
-    "XAUUSD": "frxXAUUSD",
     "USDJPY": "frxUSDJPY",
-    "BTCUSD": "cryBTCUSD",
+    "USDCHF": "frxUSDCHF",
 }
 
 DERIV_GRANULARITY = {"M1": 60, "M2": 120, "M3": 180, "M5": 300, "M15": 900}
@@ -648,11 +647,11 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
 
     base_prices = {
         "EURUSD": 1.0850, "GBPUSD": 1.2700, "XAUUSD": 2350.0,
-        "USDJPY": 150.0,  "BTCUSD": 65000.0,
+        "USDJPY": 150.0,  "BTCUSD": 65000.0, "USDCHF": 0.8800,
     }
     sigma = {
         "EURUSD": 0.0003, "GBPUSD": 0.0004, "XAUUSD": 0.8,
-        "USDJPY": 0.05,   "BTCUSD": 500.0,
+        "USDJPY": 0.05,   "BTCUSD": 500.0,  "USDCHF": 0.0003,
     }
     base    = base_prices.get(asset, 1.0)
     sig     = sigma.get(asset, 0.0003)
