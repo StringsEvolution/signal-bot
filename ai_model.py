@@ -21,11 +21,12 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "signal_model.pkl
 # Global default threshold (used by backtester and external references)
 CONFIDENCE_THRESHOLD = 80.0
 
-# Timeframe-aware thresholds — shorter TFs get lower bar since AI trained on M5/M15
+# Timeframe-aware thresholds. Floor raised to 80% on every timeframe per
+# operator request — no signal emits below 80% confidence regardless of TF.
 TF_CONFIDENCE_THRESHOLD = {
-    "M1":  65.0,
-    "M2":  60.0,
-    "M3":  60.0,
+    "M1":  80.0,
+    "M2":  80.0,
+    "M3":  80.0,
     "M5":  80.0,
     "M15": 80.0,
 }
